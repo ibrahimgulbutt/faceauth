@@ -1,0 +1,28 @@
+[package]
+name = "faceauthd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+faceauth-core = { path = "../faceauth-core" }
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.10"
+nokhwa = { version = "0.10", features = ["input-v4l", "output-threaded"] }
+image = "0.25"
+ort = { version = "2.0.0-rc.9", features = ["download-binaries"] }
+ndarray = "0.16"
+aes-gcm = "0.10"
+rand = "0.8"
+dirs = "5.0"
+sha2 = "0.10"
+base64 = "0.22"
+futures = "0.3.31"
+toml = "0.9.10"
+imageproc = "0.25.0"
+
+
+

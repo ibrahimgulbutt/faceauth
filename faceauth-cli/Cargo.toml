@@ -1,0 +1,14 @@
+[package]
+name = "faceauth-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+faceauth-core = { path = "../faceauth-core" }
+clap = { version = "4.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+
+[[bin]]
+name = "faceauth"
+path = "src/main.rs"

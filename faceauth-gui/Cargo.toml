@@ -1,0 +1,19 @@
+[package]
+name = "faceauth-gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+faceauth-core = { path = "../faceauth-core", features = ["vision"] }
+gtk4 = { version = "0.7", features = ["v4_10"] }
+libadwaita = "0.5"
+tokio = { version = "1.0", features = ["full"] }
+anyhow = "1.0"
+serde_json = "1.0"
+glib = "0.18"
+nokhwa = { version = "0.10", features = ["input-v4l", "output-wgpu"] }
+image = "0.25"
+cairo-rs = "0.18"
+ort = { version = "2.0.0-rc.9", features = ["ndarray"] }
+ndarray = "0.16"
+rusttype = "0.9"

@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "faceauth-core",
+    "faceauthd",
+    "pam_faceauth",
+    "faceauth-cli",
+    "faceauth-gui",
+]
+resolver = "2"

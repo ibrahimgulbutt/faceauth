@@ -1,0 +1,14 @@
+[Unit]
+Description=FaceAuth Authentication Daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/faceauthd
+Environment=RUST_LOG=debug
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

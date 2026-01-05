@@ -1,0 +1,29 @@
+[package]
+name = "faceauth-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+
+[features]
+default = []
+vision = ["dep:ort", "dep:image", "dep:ndarray", "dep:log"]
+
+[dependencies.ort]
+version = "2.0.0-rc.9"
+optional = true
+
+[dependencies.image]
+version = "0.25"
+optional = true
+
+[dependencies.ndarray]
+version = "0.16"
+optional = true
+
+[dependencies.log]
+version = "0.4"
+optional = true
