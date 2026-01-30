@@ -20,7 +20,16 @@ impl RateLimiter {
     }
 
     pub fn check_allowed(&self, user: &str) -> bool {
-        let mut attempts = self.attempts.lock().unwrap();
+        let mut attempts = match self.attempts.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                 warn!("RateLimiter lock poisoned. Resetting state.");
+                 let mut guard = poisoned.into_inner();
+                 guard.clear();
+                 guard
+            }
+        };
+
         if let Some((count, last_time)) = attempts.get(user) {
             if *count >= self.max_attempts {
                 if last_time.elapsed() < self.lockout_duration {
@@ -36,7 +45,13 @@ impl RateLimiter {
     }
 
     pub fn record_failure(&self, user: &str) {
-        let mut attempts = self.attempts.lock().unwrap();
+        let mut attempts = match self.attempts.lock() {
+             Ok(guard) => guard,
+             Err(poisoned) => {
+                 warn!("RateLimiter lock poisoned during record_failure.");
+                 poisoned.into_inner()
+             }
+        };
         let entry = attempts.entry(user.to_string()).or_insert((0, Instant::now()));
         entry.0 += 1;
         entry.1 = Instant::now();
@@ -44,7 +59,10 @@ impl RateLimiter {
     }
 
     pub fn reset(&self, user: &str) {
-        let mut attempts = self.attempts.lock().unwrap();
+        let mut attempts = match self.attempts.lock() {
+             Ok(guard) => guard,
+             Err(poisoned) => poisoned.into_inner()
+        };
         attempts.remove(user);
     }
 }

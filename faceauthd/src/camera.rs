@@ -41,9 +41,11 @@ impl CameraManager {
 
 
     pub fn start_session(&self) -> Result<ActiveCamera> {
+        info!("Opening camera stream...");
         let mut cam = Camera::new(self.index.clone(), self.requested.clone())
             .context("Failed to create camera instance")?;
         cam.open_stream().context("Failed to open camera stream")?;
+        info!("Camera stream opened successfully.");
         Ok(ActiveCamera { camera: cam })
     }
 }
@@ -55,8 +57,9 @@ pub struct ActiveCamera {
 impl ActiveCamera {
     pub fn warmup(&mut self, frames: usize) -> Result<()> {
         for _ in 0..frames {
+            // Just capturing the frame is enough to clear the buffer.
+            // No need to sleep; the capture itself waits for the frame interval (e.g. 33ms).
             let _ = self.camera.frame();
-            std::thread::sleep(std::time::Duration::from_millis(33));
         }
         Ok(())
     }
@@ -86,6 +89,11 @@ impl ActiveCamera {
 
 impl Drop for ActiveCamera {
     fn drop(&mut self) {
-        let _ = self.camera.stop_stream();
+        info!("Stopping camera stream...");
+        if let Err(e) = self.camera.stop_stream() {
+            log::warn!("Failed to stop camera stream gracefully: {}", e);
+        } else {
+            info!("Camera stream stopped.");
+        }
     }
 }

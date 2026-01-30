@@ -155,22 +155,16 @@ The camera will activate and authenticate you automatically. No password needed!
 ## 🛠️ Commands
 ```bash
 # Check if daemon is running
-faceauth ping
-
-# Run system diagnostics
-faceauth doctor
-
-# Benchmark performance
-faceauth benchmark
+sudo systemctl status faceauth.service
 
 # List enrolled faces
-faceauth list
+sudo faceauth list
 
 # Remove a face model
-faceauth remove <username>
+sudo faceauth remove <username>
 
 # View logs
-journalctl --user -u faceauth.service -f
+sudo journalctl -u faceauth.service -f
 ```
 
 ---
@@ -192,7 +186,7 @@ warmup_frames = 2        # Balance speed vs stability
 
 After changing config:
 ```bash
-systemctl --user restart faceauth.service
+sudo systemctl restart faceauth.service
 ```
 
 ---
@@ -207,18 +201,18 @@ ls /dev/video*
 # Test camera
 mpv /dev/video0
 
-# Add user to video group
-sudo usermod -aG video $USER
-# Log out and back in
+# Daemon runs as root, so user permissions issues are rare
+# But you can check if restricted:
+ls -l /dev/video0
 ```
 
 ### Authentication fails
 ```bash
 # Run diagnostics
-faceauth doctor
+sudo faceauth doctor
 
 # Check logs
-journalctl --user -u faceauth.service --since "5 minutes ago"
+sudo journalctl -u faceauth.service --since "5 minutes ago"
 
 # Re-enroll face
 faceauth-gui
@@ -227,13 +221,13 @@ faceauth-gui
 ### Daemon won't start
 ```bash
 # Check status
-systemctl --user status faceauth.service
+sudo systemctl status faceauth.service
 
 # View errors
-journalctl --user -u faceauth.service -f
+sudo journalctl -u faceauth.service -f
 
 # Restart daemon
-systemctl --user restart faceauth.service
+sudo systemctl restart faceauth.service
 ```
 
 ### Still having issues?

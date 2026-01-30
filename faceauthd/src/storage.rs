@@ -60,7 +60,15 @@ impl SecureStorage {
         let mut file_content = nonce.to_vec();
         file_content.extend_from_slice(&ciphertext);
 
-        fs::write(user_dir.join("models.enc"), file_content)?;
+        let final_path = user_dir.join("models.enc");
+        let temp_path = user_dir.join("models.enc.tmp");
+
+        // Atomic write: Write to temp file first
+        fs::write(&temp_path, file_content)?;
+        
+        // Then rename (atomic on POSIX)
+        fs::rename(&temp_path, &final_path).context("Failed to overwrite profile atomically")?;
+
         info!("Saved encrypted profile for user {}", profile.user);
         Ok(())
     }

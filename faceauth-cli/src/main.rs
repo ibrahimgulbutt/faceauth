@@ -3,6 +3,7 @@ use faceauth_core::{AuthRequest, AuthResponse, SOCKET_PATH};
 use std::os::unix::net::UnixStream;
 use std::io::{Read, Write};
 use anyhow::{Result, Context};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "faceauth")]
@@ -34,6 +35,12 @@ enum Commands {
     Benchmark,
 }
 
+fn set_timeout(stream: &mut UnixStream, sec: u64) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(sec)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(sec)))?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -42,7 +49,8 @@ fn main() -> Result<()> {
             println!("Running FaceAuth Benchmark...");
             let mut stream = UnixStream::connect(SOCKET_PATH)
                 .context("Failed to connect to daemon. Is it running?")?;
-            
+            set_timeout(&mut stream, 60)?;
+
             send_request(&mut stream, &AuthRequest::Benchmark)?;
             let response = read_response(&mut stream)?;
 
@@ -63,12 +71,22 @@ fn main() -> Result<()> {
             // 1. Check Daemon Connection
             print!("Checking Daemon connection... ");
             match UnixStream::connect(SOCKET_PATH) {
-                Ok(_) => println!("[OK]"),
+                Ok(mut stream) => {
+                    if set_timeout(&mut stream, 2).is_ok() 
+                       && send_request(&mut stream, &AuthRequest::Ping).is_ok() {
+                        if let Ok(AuthResponse::Pong) = read_response(&mut stream) {
+                            println!("[OK] (Pong received)");
+                        } else {
+                            println!("[WARNING] Connected but no PONG received (Timeout?)");
+                        }
+                    } else {
+                         println!("[OK] (Connected)");
+                    }
+                },
                 Err(_) => println!("[ERROR] Could not connect to {}. Is the service running?", SOCKET_PATH),
             }
 
-            // 2. Check Camera (via Daemon if possible, or local check)
-            // For now, we just check if /dev/video0 exists
+            // 2. Check Camera
             print!("Checking Camera device... ");
             if std::path::Path::new("/dev/video0").exists() {
                 println!("[OK] /dev/video0 found");
@@ -109,6 +127,7 @@ fn main() -> Result<()> {
         Commands::Ping => {
             let mut stream = UnixStream::connect(SOCKET_PATH)
                 .context("Failed to connect to daemon. Is it running?")?;
+            set_timeout(&mut stream, 5)?;
             
             send_request(&mut stream, &AuthRequest::Ping)?;
             let response = read_response(&mut stream)?;
@@ -127,6 +146,7 @@ fn main() -> Result<()> {
             
             let mut stream = UnixStream::connect(SOCKET_PATH)
                 .context("Failed to connect to daemon. Is it running?")?;
+            set_timeout(&mut stream, 60)?;
             
             send_request(&mut stream, &AuthRequest::Enroll { user, name })?;
             let response = read_response(&mut stream)?;
@@ -146,6 +166,7 @@ fn main() -> Result<()> {
             println!("Testing authentication for user: {}", user);
             let mut stream = UnixStream::connect(SOCKET_PATH)
                 .context("Failed to connect to daemon. Is it running?")?;
+            set_timeout(&mut stream, 20)?;
             
             send_request(&mut stream, &AuthRequest::Authenticate { user: user.clone() })?;
             
@@ -161,6 +182,7 @@ fn main() -> Result<()> {
         Commands::List => {
             let mut stream = UnixStream::connect(SOCKET_PATH)
                 .context("Failed to connect to daemon. Is it running?")?;
+            set_timeout(&mut stream, 5)?;
             
             send_request(&mut stream, &AuthRequest::ListEnrolled)?;
             let response = read_response(&mut stream)?;

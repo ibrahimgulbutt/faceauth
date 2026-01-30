@@ -4,7 +4,7 @@ use ndarray::Array;
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::Value;
 use std::path::Path;
-use log::{info, debug, warn};
+use log::{info, warn};
 
 use std::sync::Mutex;
 
@@ -20,17 +20,38 @@ impl FaceDetector {
         let parent = model_path.parent().unwrap();
         let quantized_path = parent.join(format!("{}_int8.onnx", model_name));
         
-        let final_path = if quantized_path.exists() {
-            info!("Found quantized detection model: {:?}", quantized_path);
+        // Solid Solution Fix: Check size > 0, not just existence
+        let is_valid_quantized = if quantized_path.exists() {
+            if let Ok(metadata) = std::fs::metadata(&quantized_path) {
+                metadata.len() > 0
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let final_path = if is_valid_quantized {
+            info!("Found valid quantized detection model: {:?}", quantized_path);
             quantized_path
         } else {
+            if quantized_path.exists() {
+                warn!("Found quantized model {:?} but it is empty/invalid. Falling back to standard model.", quantized_path);
+            }
             model_path.to_path_buf()
         };
 
+        // Threading Optimization:
+        // Since we process multiple frames in parallel at the application level,
+        // we MUST strictly limit internal ONNX Runtime threading to avoid contention.
+        let intra_threads = 1;
+        
+        info!("Initializing FaceDetector with {} thread (optimized for parallel requests)", intra_threads);
+
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(4)?
-            .with_parallel_execution(true)?
+            .with_intra_threads(intra_threads)?
+            .with_parallel_execution(false)?
             .commit_from_file(final_path)?;
         
         Ok(Self { session: Mutex::new(session), threshold })
@@ -66,7 +87,8 @@ impl FaceDetector {
 
         let input_tensor = Value::from_array(input)?;
         info!("[Detection] Running ONNX inference...");
-        let mut session = self.session.lock().unwrap();
+        let mut session = self.session.lock()
+            .map_err(|e| anyhow::anyhow!("Detection session lock poisoned: {}", e))?;
         let outputs = session.run(ort::inputs![input_tensor])?;
         info!("[Detection] Inference complete. Outputs: {}", outputs.len());
         

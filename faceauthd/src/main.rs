@@ -23,6 +23,64 @@ use storage::{SecureStorage, UserProfile};
 use config::Config;
 use security::{RateLimiter, AuditLogger};
 
+fn check_system_capabilities() -> Result<()> {
+    // 1. Check Memory via /proc/meminfo
+    if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
+        for line in meminfo.lines() {
+            if line.starts_with("MemAvailable:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(kb) = parts[1].parse::<u64>() {
+                        let mb = kb / 1024;
+                        info!("System Capability Check: {} MB RAM available", mb);
+                        if mb < 500 {
+                            warn!("Low memory detected ({} MB). Processing might be slow or unstable.", mb);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check CPU Cores
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    info!("System Capability Check: {} CPU cores detected", cores);
+    if cores < 2 {
+        warn!("Single-core CPU detected. Performance might be impacted.");
+    }
+
+    // 3. Check Disk Space on / (Root)
+    match std::process::Command::new("df").arg("-P").arg("/").output() {
+        Ok(output) => {
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+                let lines: Vec<&str> = stdout.lines().collect();
+                // Expect header + 1 line
+                if lines.len() >= 2 {
+                    let parts: Vec<&str> = lines[1].split_whitespace().collect();
+                    // Fields: Filesystem 1024-blocks Used Available Capacity Mounted on
+                    // Available is index 3
+                    if parts.len() >= 4 {
+                        if let Ok(avail_kb) = parts[3].parse::<u64>() {
+                            let avail_mb = avail_kb / 1024;
+                            info!("System Capability Check: {} MB Disk Space available on /", avail_mb);
+                            if avail_mb < 500 { // Less than 500MB
+                                warn!("Critical: Very low disk space ({} MB). System might hang on logging or writes.", avail_mb);
+                            } else if avail_mb < 2048 { // Less than 2GB
+                                warn!("Low disk space ({} MB).", avail_mb);
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        Err(e) => {
+            warn!("Could not check disk space: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Force info level if RUST_LOG is not set
@@ -31,6 +89,11 @@ async fn main() -> Result<()> {
     }
     env_logger::init();
     info!("Starting faceauthd (Phase 4)...");
+
+    // Perform Infrastructure Checks
+    if let Err(e) = check_system_capabilities() {
+        warn!("Failed to perform system capability checks: {}", e);
+    }
 
     let config = match Config::load() {
         Ok(c) => Arc::new(c),
@@ -87,7 +150,10 @@ async fn main() -> Result<()> {
     info!("Listening on {}", SOCKET_PATH);
 
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(SOCKET_PATH, fs::Permissions::from_mode(0o777))?;
+    // Security: Use 666 (RW-RW-RW-) instead of 777.
+    // Executable permission is not needed for sockets.
+    // 666 allows PAM (root) and GUI (user) to connect.
+    fs::set_permissions(SOCKET_PATH, fs::Permissions::from_mode(0o666))?;
 
     loop {
         match listener.accept().await {
@@ -236,46 +302,61 @@ async fn handle_client(
 
             AuthRequest::EnrollSample { user, image_data, width, height } => {
                 // Process the frame sent by GUI
-                // Convert Vec<u8> to ImageBuffer
                 if let Some(img) = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(width, height, image_data) {
-                     match engine.get_embedding(&img) {
-                        Ok(embedding) => {
-                            // Load existing profile or create new
-                            let mut profile = storage.load_user(&user)?.unwrap_or(UserProfile {
-                                user: user.clone(),
-                                name: user.clone(),
-                                embeddings: vec![],
-                                last_updated: 0,
-                            });
-                            
-                            // Phase 2: Validate enrollment sample
-                            // Check for duplicates (too similar to existing)
-                            let mut is_duplicate = false;
-                            for existing in &profile.embeddings {
-                                let score = engine.compare(&embedding, existing);
-                                if score > 0.95 {
-                                    is_duplicate = true;
-                                    break;
+                    
+                    // 1. Detect Face in the raw frame
+                    match detector.detect(&img) {
+                        Ok(Some(cropped_face)) => {
+                             // 2. Get Embedding from cropped face
+                             match engine.get_embedding(&cropped_face) {
+                                Ok(embedding) => {
+                                    // Load existing profile or create new
+                                    let mut profile = storage.load_user(&user)?.unwrap_or(UserProfile {
+                                        user: user.clone(),
+                                        name: user.clone(),
+                                        embeddings: vec![],
+                                        last_updated: 0,
+                                    });
+                                    
+                                    // Check for duplicates
+                                    let mut is_duplicate = false;
+                                    for existing in &profile.embeddings {
+                                        let score = engine.compare(&embedding, existing);
+                                        if score > 0.95 {
+                                            is_duplicate = true;
+                                            break;
+                                        }
+                                    }
+
+                                    if is_duplicate {
+                                        AuthResponse::EnrollmentStatus { 
+                                            message: "Hold steady or turn slightly".to_string(), 
+                                            progress: profile.embeddings.len() as f32 
+                                        }
+                                    } else {
+                                        profile.embeddings.push(embedding);
+                                        profile.last_updated = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+                                        
+                                        storage.save_user(&profile)?;
+                                        AuthResponse::Success
+                                    }
+                                },
+                                Err(e) => {
+                                    error!("Embedding failed: {}", e);
+                                    AuthResponse::Failure
                                 }
                             }
-
-                            if is_duplicate {
-                                warn!("Duplicate enrollment sample rejected for user {}", user);
-                                AuthResponse::EnrollmentStatus { 
-                                    message: "Duplicate angle - please move your head slightly".to_string(), 
-                                    progress: profile.embeddings.len() as f32 / 5.0 
-                                }
-                            } else {
-                                profile.embeddings.push(embedding);
-                                profile.last_updated = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
-                                
-                                storage.save_user(&profile)?;
-                                AuthResponse::Success
+                        },
+                        Ok(None) => {
+                            // No face detected
+                             AuthResponse::EnrollmentStatus { 
+                                message: "No face detected".to_string(), 
+                                progress: -1.0 
                             }
                         },
                         Err(e) => {
-                            error!("Embedding failed: {}", e);
-                            AuthResponse::Failure
+                             error!("Detection failed: {}", e);
+                             AuthResponse::Failure
                         }
                     }
                 } else {
@@ -337,7 +418,24 @@ async fn handle_client(
                         let mut cam_mgr = futures::executor::block_on(camera_clone.lock());
                         
                         // Start Session
-                        let mut active_cam = cam_mgr.start_session()?;
+                        // Solid Solution Fix: Retry logic for wake-from-sleep race condition
+                        let mut active_cam = match cam_mgr.start_session() {
+                            Ok(cam) => cam,
+                            Err(e) => {
+                                warn!("Camera busy/unavailable, retrying after 500ms... ({})", e);
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                match cam_mgr.start_session() {
+                                    Ok(cam) => cam,
+                                    Err(e2) => {
+                                        error!("Camera init permanently failed: {}", e2);
+                                        // Sleep to prevent tight loop CPU spike if GDM retries rapidly
+                                        std::thread::sleep(std::time::Duration::from_secs(2));
+                                        return Err(e2);
+                                    }
+                                }
+                            }
+                        };
+                        
                         active_cam.warmup(config_clone.camera.warmup_frames)?;
                         
                         // Capture Frame 0
@@ -421,14 +519,19 @@ async fn handle_client(
                 if let Ok(Ok(Some(face0))) = detection_result {
                     crops.push(face0);
                     
-                    // Step 3e: Adaptive - Use center crop for remaining frames
+                    // Step 3e: Adaptive - Use center crop for remaining frames (Parallelized)
+                    let mut crop_tasks = Vec::new();
                     for i in 1..frames.len() {
                         let detector_clone = detector.clone();
                         let frame = frames[i].clone();
-                        let crop = tokio::task::spawn_blocking(move || {
+                        crop_tasks.push(tokio::task::spawn_blocking(move || {
                             detector_clone.get_center_crop(&frame)
-                        }).await;
-                        if let Ok(c) = crop {
+                        }));
+                    }
+
+                    let crop_results = futures::future::join_all(crop_tasks).await;
+                    for res in crop_results {
+                        if let Ok(c) = res {
                             crops.push(c);
                         }
                     }

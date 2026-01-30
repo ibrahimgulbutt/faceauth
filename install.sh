@@ -192,38 +192,51 @@ sudo install -m 644 target/release/libpam_faceauth.so "$PAM_DIR/pam_faceauth.so"
 
 echo -e "${GREEN}✅ Binaries installed${NC}"
 
-# Setup systemd service
+# Setup systemd service (System-wide)
 echo
-echo -e "${BLUE}⚙️  Setting up service...${NC}"
+echo -e "${BLUE}⚙️  Setting up system service...${NC}"
 
-mkdir -p ~/.config/systemd/user
+# Remove conflicting user service if present
+systemctl --user stop faceauth.service 2>/dev/null || true
+systemctl --user disable faceauth.service 2>/dev/null || true
+rm -f ~/.config/systemd/user/faceauth.service 2>/dev/null || true
+systemctl --user daemon-reload 2>/dev/null || true
 
-cat > ~/.config/systemd/user/faceauth.service << 'EOF'
+# Install System Service
+cat > faceauth.service << 'EOF'
 [Unit]
 Description=FaceAuth Daemon
 After=network.target
 
 [Service]
-Type=simple
 ExecStart=/usr/local/bin/faceauthd
-Restart=on-failure
+Environment=RUST_LOG=info
+Restart=always
 RestartSec=5
+User=root
+Group=root
+
+# Performance Tuning
+MemorySwapMax=0
+Nice=-10
+Environment=MALLOC_ARENA_MAX=2
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 EOF
 
-systemctl --user daemon-reload
-systemctl --user enable faceauth.service --quiet
-systemctl --user start faceauth.service
+sudo mv faceauth.service /etc/systemd/system/faceauth.service
+sudo systemctl daemon-reload
+sudo systemctl enable faceauth.service
+sudo systemctl restart faceauth.service
 
 sleep 2
 
-if systemctl --user is-active --quiet faceauth.service; then
-    echo -e "${GREEN}✅ Service started${NC}"
+if systemctl is-active --quiet faceauth.service; then
+    echo -e "${GREEN}✅ System service started${NC}"
 else
-    echo -e "${YELLOW}⚠️  Service failed to start${NC}"
-    echo "Check logs: journalctl --user -u faceauth.service"
+    echo -e "${YELLOW}⚠️  System service failed to start${NC}"
+    echo "Check logs: sudo journalctl -u faceauth.service"
 fi
 
 # Download AI models
@@ -236,14 +249,21 @@ download_model() {
     local filename=$2
     local filepath="/usr/share/faceauth/models/$filename"
     
-    if [ ! -f "$filepath" ]; then
+    if [ ! -f "$filepath" ] || [ ! -s "$filepath" ]; then
         echo "  Downloading $filename..."
         sudo wget -q --show-progress -O "$filepath" "$url" 2>&1 | \
             grep --line-buffered -oP '\d+%' | \
             while read -r line; do
                 echo -ne "  $line\r"
             done
-        echo -e "  ${GREEN}✓${NC}"
+        
+        # Verify download (size > 0)
+        if [ ! -s "$filepath" ]; then
+            echo -e "  ${RED}Failed (Empty file)${NC}"
+            sudo rm "$filepath"
+        else
+            echo -e "  ${GREEN}✓${NC}"
+        fi
     else
         echo -e "  $filename ${GREEN}already exists${NC}"
     fi

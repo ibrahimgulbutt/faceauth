@@ -45,7 +45,8 @@ pub extern "C" fn pam_sm_authenticate(
     };
 
     // Set timeouts to prevent hanging sudo
-    let timeout = std::time::Duration::from_secs(5);
+    // Increased to 15s to allow for camera wake-up on resume + AI inference time
+    let timeout = std::time::Duration::from_secs(15);
     if stream.set_read_timeout(Some(timeout)).is_err() || stream.set_write_timeout(Some(timeout)).is_err() {
         return PAM_SERVICE_ERR;
     }

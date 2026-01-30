@@ -1,6 +1,7 @@
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, Button, Box, Orientation, Label, ProgressBar, Picture, Stack};
+use gtk4::{Button, Box, Orientation, Label, ProgressBar, Picture, Stack, AspectFrame};
 use libadwaita::prelude::*;
+use libadwaita as adw;
 use std::thread;
 use std::sync::{Arc, Mutex};
 use std::os::unix::net::UnixStream;
@@ -13,112 +14,137 @@ use nokhwa::Camera;
 use image::{ImageBuffer, Rgb};
 use gtk4::gdk::{Texture, MemoryTexture, MemoryFormat};
 use std::path::Path;
+use std::time::Duration;
 
-mod detection;
-use detection::FaceDetector;
+// ... imports remain the same ...
+
+// mod detection; // Removed client-side detection
+// use detection::FaceDetector;
 
 const APP_ID: &str = "org.faceauth.gui";
 
 fn main() {
-    let app = Application::builder().application_id(APP_ID).build();
+    let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
     app.run();
 }
 
-fn build_ui(app: &Application) {
+fn build_ui(app: &adw::Application) {
     let content = Box::new(Orientation::Vertical, 0);
-    content.set_margin_top(24);
-    content.set_margin_bottom(24);
-    content.set_margin_start(24);
-    content.set_margin_end(24);
-    content.set_spacing(12);
-
-    let title = Label::builder()
-        .label("FaceAuth Enrollment")
-        .css_classes(vec!["title-1"])
-        .build();
-    content.append(&title);
-
-    let status_text = get_enrollment_status();
-    let status_label = Label::builder()
-        .label(&status_text)
-        .build();
-    content.append(&status_label);
-
-    // Camera Preview Area
-    let picture = Picture::builder()
-        .width_request(640)
-        .height_request(480)
-        .can_shrink(true)
-        .content_fit(gtk4::ContentFit::Contain)
-        .build();
     
-    // Placeholder for camera
-    let placeholder = Label::new(Some("Camera Off"));
-    placeholder.set_height_request(480);
+    // Header Bar
+    let header_bar = adw::HeaderBar::new();
+    content.append(&header_bar);
 
+    // Main Stack for "Welcome/Status" vs "Enrollment"
     let stack = Stack::new();
-    stack.add_child(&placeholder);
-    stack.add_child(&picture);
-    content.append(&stack);
-
-    let instruction_label = Label::builder()
-        .label("Ready to Enroll")
-        .css_classes(vec!["title-2"])
-        .build();
+    stack.set_transition_type(gtk4::StackTransitionType::SlideLeftRight);
     
-    let progress_bar = ProgressBar::builder()
-        .visible(false)
+    // Page 1: Status & Welcome
+    let status_page = adw::StatusPage::builder()
+        .title("FaceAuth Enrollment")
+        .description(get_enrollment_status().as_str())
+        .icon_name("camera-web-symbolic")
         .build();
 
     let enroll_btn = Button::builder()
         .label("Start Enrollment")
         .css_classes(vec!["suggested-action", "pill"])
+        .halign(gtk4::Align::Center)
+        .margin_bottom(20)
         .build();
     
+    let status_box = Box::new(Orientation::Vertical, 12);
+    status_box.append(&status_page);
+    status_box.append(&enroll_btn);
+    stack.add_named(&status_box, Some("status"));
+
+    // Page 2: Enrollment (Camera)
+    let enroll_box = Box::new(Orientation::Vertical, 12);
+    enroll_box.set_valign(gtk4::Align::Center);
+    enroll_box.set_halign(gtk4::Align::Center);
+
+    let instruction_label = Label::builder()
+        .label("Initializing...")
+        .css_classes(vec!["title-2"])
+        .build();
+    
+    let progress_bar = ProgressBar::builder()
+        .show_text(true)
+        .fraction(0.0)
+        .build();
+
+    // Aspect Frame to keep camera ratio
+    let aspect_frame = AspectFrame::builder()
+        .xalign(0.5)
+        .yalign(0.5)
+        .ratio(4.0/3.0)
+        .obey_child(false)
+        .width_request(640)
+        .height_request(480)
+        .build();
+    
+    let picture = Picture::builder()
+        .can_shrink(true)
+        .content_fit(gtk4::ContentFit::Cover)
+        .build();
+    
+    aspect_frame.set_child(Some(&picture));
+    
+    enroll_box.append(&instruction_label);
+    enroll_box.append(&aspect_frame);
+    enroll_box.append(&progress_bar);
+
+    stack.add_named(&enroll_box, Some("enroll"));
+    content.append(&stack);
+
+    // Clones for Closure
+    let stack_clone = stack.clone();
     let instruction_label_clone = instruction_label.clone();
     let progress_bar_clone = progress_bar.clone();
-    let enroll_btn_clone = enroll_btn.clone();
     let picture_clone = picture.clone();
-    let stack_clone = stack.clone();
-    let placeholder = placeholder.clone(); // Clone for the outer closure
+    let enroll_btn_clone = enroll_btn.clone();
 
+    // Logic
     enroll_btn.connect_clicked(move |_| {
-        let instruction_label = instruction_label_clone.clone();
-        let progress_bar = progress_bar_clone.clone();
-        let enroll_btn = enroll_btn_clone.clone();
-        let picture = picture_clone.clone();
-        let stack = stack_clone.clone();
-        let placeholder = placeholder.clone(); // Clone for the outer closure
-
-        enroll_btn.set_sensitive(false);
-        progress_bar.set_visible(true);
-        progress_bar.set_fraction(0.0);
-        instruction_label.set_label("Initializing Camera...");
-        stack.set_visible_child(&picture);
-
+        stack_clone.set_visible_child_name("enroll");
+        enroll_btn_clone.set_sensitive(false);
+        
         let (tx, rx) = glib::MainContext::channel(glib::Priority::default());
+        
+        // Clone widgets for the channel callback
+        let picture_inner = picture_clone.clone();
+        let instruction_inner = instruction_label_clone.clone();
+        let progress_inner = progress_bar_clone.clone();
+        let stack_inner = stack_clone.clone();
 
-        let placeholder_inner = placeholder.clone(); // Clone for the inner closure
         rx.attach(None, move |msg: EnrollmentUpdate| {
             match msg {
                 EnrollmentUpdate::Frame(texture) => {
-                    picture.set_paintable(Some(&texture));
+                    picture_inner.set_paintable(Some(&texture));
                 }
                 EnrollmentUpdate::Status(text, progress) => {
-                    instruction_label.set_label(&text);
-                    progress_bar.set_fraction(progress as f64);
+                    instruction_inner.set_label(&text);
+                    progress_inner.set_fraction(progress as f64);
                 }
                 EnrollmentUpdate::Success => {
-                    instruction_label.set_label("Enrollment Complete!");
-                    progress_bar.set_fraction(1.0);
-                    enroll_btn.set_sensitive(true);
-                    stack.set_visible_child(&placeholder_inner);
+                    instruction_inner.set_label("Enrollment Complete!");
+                    progress_inner.set_fraction(1.0);
+                    // Return to start after 2s
+                    let final_stack = stack_inner.clone();
+                    glib::timeout_add_seconds_local(2, move || {
+                        final_stack.set_visible_child_name("status");
+                        glib::ControlFlow::Break
+                    });
                 }
                 EnrollmentUpdate::Error(e) => {
-                    instruction_label.set_label(&format!("Error: {}", e));
-                    enroll_btn.set_sensitive(true);
-                    stack.set_visible_child(&placeholder_inner);
+                    instruction_inner.set_label(&format!("Error: {}", e));
+                    // Return to main menu on error
+                    let final_stack = stack_inner.clone();
+                     glib::timeout_add_seconds_local(3, move || {
+                        final_stack.set_visible_child_name("status");
+                        glib::ControlFlow::Break
+                    });
                 }
             }
             glib::ControlFlow::Continue
@@ -131,20 +157,17 @@ fn build_ui(app: &Application) {
         });
     });
 
-    content.append(&instruction_label);
-    content.append(&progress_bar);
-    content.append(&enroll_btn);
-
-    let window = ApplicationWindow::builder()
+    let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("FaceAuth")
         .default_width(800)
-        .default_height(600)
-        .child(&content)
+        .default_height(700)
+        .content(&content)
         .build();
 
     window.present();
 }
+
 
 enum EnrollmentUpdate {
     Frame(Texture),
@@ -156,63 +179,108 @@ enum EnrollmentUpdate {
 fn run_enrollment_process(tx: glib::Sender<EnrollmentUpdate>) -> anyhow::Result<()> {
     // 1. Open Camera
     let index = CameraIndex::Index(0);
-    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+    // Request 640x480 specifically for GUI to reduce bandwidth/processing
+    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
+        nokhwa::utils::CameraFormat::new_from(640, 480, nokhwa::utils::FrameFormat::MJPEG, 30)
+    ));
     let mut camera = Camera::new(index, requested)?;
     camera.open_stream()?;
 
-    // 2. Initialize Detector
-    let mut detector = FaceDetector::new(Path::new("/usr/share/faceauth/models/det_500m.onnx"))
-        .map_err(|e| anyhow::anyhow!("Failed to load detector: {}", e))?;
-
-    // 3. Connect to Daemon
+    // 2. Connect to Daemon
     let mut stream = UnixStream::connect(SOCKET_PATH)?;
+    // Set 60s timeout for enrollment IPC to prevent hanging
+    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(60)))?;
+
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
 
     let _ = tx.send(EnrollmentUpdate::Status("Center your face".to_string(), 0.0));
 
-    // 4. Capture Loop
+    // 3. Capture Loop
     let steps = vec![
-        ("Center", 30),
-        ("Turn Left", 30),
-        ("Turn Right", 30),
-        ("Look Up", 30),
-        ("Look Down", 30),
+        ("Center", 40),
+        ("Turn Left", 40),
+        ("Turn Right", 40),
+        ("Look Up", 40),
+        ("Look Down", 40),
     ];
 
     let total_frames: usize = steps.iter().map(|(_, c)| c).sum();
     let mut current_frame_count = 0;
+    
+    // Tracking
+    // let mut last_bbox: Option<(u32, u32, u32, u32)> = None; // removed
 
     for (step_name, frames_needed) in steps {
         let _ = tx.send(EnrollmentUpdate::Status(format!("Step: {}", step_name), current_frame_count as f32 / total_frames as f32));
         
-        for i in 0..frames_needed {
+        let mut frames_collected = 0;
+        // Loop until we get enough "good" frames or timeout (optional, let's keep it simple for now)
+        // Check "Active Liveness" via daemon response
+        
+        while frames_collected < frames_needed {
             let frame = camera.frame()?;
             let mut rgb_frame = frame.decode_image::<RgbFormat>()?;
             
-            // Run Detection
-            if let Ok(Some((x1, y1, x2, y2))) = detector.detect(&rgb_frame) {
-                // Draw Bounding Box (Green)
-                draw_rect(&mut rgb_frame, x1, y1, x2, y2, [0, 255, 0]);
+            // Draw Static Guidance Overlay
+            draw_overlay(&mut rgb_frame);
+            
+            // Send sample to daemon periodically (every 10th frame ~ 3 times per second)
+            if frames_collected % 10 == 0 {
+                let req = AuthRequest::EnrollSample {
+                    user: user.clone(),
+                    image_data: rgb_frame.to_vec(),
+                    width: rgb_frame.width(),
+                    height: rgb_frame.height(),
+                };
                 
-                // Send frame to daemon if it's a "good" frame (e.g., every 5th frame)
-                if i % 5 == 0 {
-                    let req = AuthRequest::EnrollSample {
-                        user: user.clone(),
-                        image_data: rgb_frame.to_vec(),
-                        width: rgb_frame.width(),
-                        height: rgb_frame.height(),
-                    };
-                    send_request(&mut stream, req)?;
-                    // Read response (simple success check)
-                    read_response(&mut stream)?;
+                // If daemon fails, we might just retry
+                match send_request(&mut stream, req) {
+                     Ok(_) => {
+                         match read_response(&mut stream) {
+                             Ok(AuthResponse::Success) => {
+                                 // Good frame, advance
+                                 frames_collected += 1;
+                                 current_frame_count += 1;
+                             },
+                             Ok(AuthResponse::EnrollmentStatus { message, progress }) => {
+                                 if progress < 0.0 {
+                                     // No face detected
+                                     let _ = tx.send(EnrollmentUpdate::Status("No Face Detected".to_string(), current_frame_count as f32 / total_frames as f32));
+                                     // Do NOT advance frames_collected
+                                 } else {
+                                     // Duplicate or other message
+                                     let _ = tx.send(EnrollmentUpdate::Status(message, current_frame_count as f32 / total_frames as f32));
+                                     // Do NOT advance
+                                 }
+                             },
+                             Ok(AuthResponse::Failure) => {
+                                 // Daemon error?
+                                  let _ = tx.send(EnrollmentUpdate::Status("Server Error".to_string(), current_frame_count as f32 / total_frames as f32));
+                             },
+                             _ => {}
+                         }
+                     },
+                     Err(e) => {
+                         // Connection lost?
+                         return Err(anyhow::anyhow!("Daemon connection lost: {}", e));
+                     }
                 }
+            } else {
+                // For non-sample frames, just advance visual fluidity
+                // But we don't advance "progress" unless we confirm via daemon.
+                // Actually to make it smooth, we can just advance the loop but not "count" it towards the step completion?
+                // The "frames_needed" is just a duration proxy here.
+                // Let's just advance frames_collected for visual frames, but maybe slow down if NO face.
+                frames_collected += 1;
+                current_frame_count += 1; // Update visual progress for smoothness
             }
 
-            // Convert to GDK Texture
+            // Convert and Send Frame to UI
             let width = rgb_frame.width() as i32;
             let height = rgb_frame.height() as i32;
             let stride = width as usize * 3;
-            let bytes = glib::Bytes::from(&rgb_frame.into_raw());
+            let bytes = glib::Bytes::from(&rgb_frame.into_raw()); 
             
             let texture = MemoryTexture::new(
                 width, 
@@ -224,12 +292,11 @@ fn run_enrollment_process(tx: glib::Sender<EnrollmentUpdate>) -> anyhow::Result<
             
             let _ = tx.send(EnrollmentUpdate::Frame(texture.upcast()));
             
-            current_frame_count += 1;
             if current_frame_count % 5 == 0 {
                  let _ = tx.send(EnrollmentUpdate::Status(format!("Step: {}", step_name), current_frame_count as f32 / total_frames as f32));
             }
-
-            thread::sleep(std::time::Duration::from_millis(30));
+            
+            thread::sleep(std::time::Duration::from_millis(15));
         }
     }
 
@@ -237,18 +304,40 @@ fn run_enrollment_process(tx: glib::Sender<EnrollmentUpdate>) -> anyhow::Result<
     Ok(())
 }
 
+fn draw_overlay(image: &mut ImageBuffer<Rgb<u8>, Vec<u8>>) {
+    let (w, h) = image.dimensions();
+    let cx = w / 2;
+    let cy = h / 2;
+    let box_size = 300; // 300x300 box
+    let half = box_size / 2;
+    
+    // Draw Center Box (Static Guidance)
+    if cx > half && cy > half {
+         draw_rect(image, cx - half, cy - half, cx + half, cy + half, [255, 255, 255]);
+    }
+    
+    // Draw crosshair
+    draw_rect(image, cx - 20, cy, cx + 20, cy + 2, [200, 200, 200]);
+    draw_rect(image, cx, cy - 20, cx + 2, cy + 20, [200, 200, 200]);
+}
+
 fn draw_rect(image: &mut ImageBuffer<Rgb<u8>, Vec<u8>>, x1: u32, y1: u32, x2: u32, y2: u32, color: [u8; 3]) {
     let (w, h) = image.dimensions();
+    // 2px thickness
     for x in x1..x2 {
-        if x < w {
-            if y1 < h { image.put_pixel(x, y1, Rgb(color)); }
-            if y2 < h { image.put_pixel(x, y2, Rgb(color)); }
+        for t in 0..2 {
+            if x < w {
+                if y1 + t < h { image.put_pixel(x, y1 + t, Rgb(color)); }
+                if y2 + t < h && y2 + t > 0 { image.put_pixel(x, y2 - t, Rgb(color)); }
+            }
         }
     }
     for y in y1..y2 {
-        if y < h {
-            if x1 < w { image.put_pixel(x1, y, Rgb(color)); }
-            if x2 < w { image.put_pixel(x2, y, Rgb(color)); }
+        for t in 0..2 {
+            if y < h {
+                if x1 + t < w { image.put_pixel(x1 + t, y, Rgb(color)); }
+                if x2 + t < w && x2 + t > 0 { image.put_pixel(x2 - t, y, Rgb(color)); }
+            }
         }
     }
 }
@@ -274,6 +363,10 @@ fn read_response(stream: &mut UnixStream) -> anyhow::Result<AuthResponse> {
 fn get_enrollment_status() -> String {
     match UnixStream::connect(SOCKET_PATH) {
         Ok(mut stream) => {
+            // Set short timeout (5s) for status check
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
             let request = AuthRequest::ListEnrolled;
             if send_request(&mut stream, request).is_ok() {
                 if let Ok(response) = read_response(&mut stream) {

@@ -5,7 +5,7 @@ use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::Value;
 use std::path::Path;
 use std::sync::Mutex;
-use log::{info, error};
+use log::{info, error, warn};
 use imageproc::contrast::equalize_histogram;
 
 
@@ -26,20 +26,52 @@ impl FaceEngine {
         
         // Check for quantized model
         let quantized_path = Path::new("/usr/share/faceauth/models/arcface_int8.onnx");
-        let final_path = if quantized_path.exists() {
-            info!("Found quantized recognition model: {:?}", quantized_path);
+        
+        // Solid Solution Fix: Check size > 0
+        let is_valid_quantized = if quantized_path.exists() {
+            if let Ok(metadata) = std::fs::metadata(&quantized_path) {
+                metadata.len() > 0
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let final_path = if is_valid_quantized {
+            info!("Found valid quantized recognition model: {:?}", quantized_path);
             quantized_path
         } else {
+            if quantized_path.exists() {
+                warn!("Found quantized model {:?} but it is empty/invalid. Falling back to standard model.", quantized_path);
+            }
             model_path
         };
 
+        // Threading Optimization:
+        // Use single-threaded inference per session to allow maximum parallel throughput of frames
+        let intra_threads = 1;
+
         let recognition_session = if final_path.exists() {
-            info!("Loading ArcFace model from {:?}", final_path);
-            Some(Mutex::new(Session::builder()?
-                .with_optimization_level(GraphOptimizationLevel::Level3)?
-                .with_intra_threads(4)?
-                .with_parallel_execution(true)?
-                .commit_from_file(final_path)?))
+            info!("Loading ArcFace model from {:?} with {} thread (Parallel-Optimized)", final_path, intra_threads);
+            match Session::builder() {
+                Ok(builder) => {
+                    match builder
+                        .with_optimization_level(GraphOptimizationLevel::Level3)
+                        .and_then(|b| b.with_intra_threads(intra_threads))
+                        .and_then(|b| b.with_parallel_execution(false))
+                        .and_then(|b| b.commit_from_file(final_path)) 
+                    {
+                        Ok(s) => Some(Mutex::new(s)),
+                        Err(e) => {
+                            error!("CRITICAL: Failed to load Recognition Model from {:?}: {}", final_path, e);
+                            error!("Possible causes: Corrupted file, Missing permissions, or Incompatible CPU instruction set.");
+                            return Err(e.into());
+                        }
+                    }
+                },
+                Err(e) => return Err(e.into()),
+            }
         } else {
             error!("ArcFace model not found at {:?}. Recognition will fail.", model_path);
             None
@@ -79,7 +111,9 @@ impl FaceEngine {
             let input_array = self.preprocess(image)?;
             let input_tensor = Value::from_array(input_array)?;
             
-            let mut session = session_mutex.lock().unwrap();
+            let mut session = session_mutex.lock()
+                .map_err(|e| anyhow::anyhow!("Recognition session lock poisoned: {}", e))?;
+
             let outputs = session.run(ort::inputs![input_tensor])?;
             
             let (_shape, data) = outputs[0].try_extract_tensor::<f32>()?;
