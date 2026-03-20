@@ -276,7 +276,12 @@ fn build_ui(app: &adw::Application) {
     enroll_outer.append(&bottom_strip);
 
     stack.add_named(&enroll_outer, Some("enroll"));
-    content.append(&stack);
+
+    // Toast overlay wraps the stack so toasts float above any page
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&stack));
+    toast_overlay.set_vexpand(true);
+    content.append(&toast_overlay);
 
     // ── Window ────────────────────────────────────────────────────────────────
     let window = adw::ApplicationWindow::builder()
@@ -293,18 +298,20 @@ fn build_ui(app: &adw::Application) {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     fn start_enrollment(
-        tx:           glib::Sender<EnrollmentUpdate>,
-        rx:           glib::Receiver<EnrollmentUpdate>,
-        delete_first: bool,
-        picture:      gtk4::Picture,
-        instruction:  gtk4::Label,
-        sub_label:    gtk4::Label,
-        progress:     gtk4::ProgressBar,
-        counter:      gtk4::Label,
-        stack:        gtk4::Stack,
-        enroll_row:   adw::ActionRow,
-        add_row:      adw::ActionRow,
-        delete_row:   adw::ActionRow,
+        tx:            glib::Sender<EnrollmentUpdate>,
+        rx:            glib::Receiver<EnrollmentUpdate>,
+        delete_first:  bool,
+        picture:       gtk4::Picture,
+        instruction:   gtk4::Label,
+        sub_label:     gtk4::Label,
+        progress:      gtk4::ProgressBar,
+        counter:       gtk4::Label,
+        stack:         gtk4::Stack,
+        enroll_row:    adw::ActionRow,
+        add_row:       adw::ActionRow,
+        delete_row:    adw::ActionRow,
+        status_row:    adw::ActionRow,
+        toast_overlay: adw::ToastOverlay,
     ) {
         rx.attach(None, move |msg: EnrollmentUpdate| {
             match msg {
@@ -320,16 +327,30 @@ fn build_ui(app: &adw::Application) {
                 }
                 EnrollmentUpdate::Success => {
                     instruction.set_label("All done!");
-                    sub_label.set_label("Face enrollment complete. You can now log in with your face.");
+                    sub_label.set_label("Face enrollment complete. You can now log in.");
                     progress.set_fraction(1.0);
                     counter.set_label("10 / 10 samples");
-                    let (s, er, ar, dr) = (
+
+                    // Show a toast notification immediately
+                    let toast = adw::Toast::builder()
+                        .title("Enrollment complete — you can now log in with your face")
+                        .timeout(5)
+                        .build();
+                    toast_overlay.add_toast(toast);
+
+                    let (s, er, ar, dr, sr) = (
                         stack.clone(),
                         enroll_row.clone(),
                         add_row.clone(),
                         delete_row.clone(),
+                        status_row.clone(),
                     );
                     glib::timeout_add_seconds_local(2, move || {
+                        // Refresh the status card with the latest count from daemon
+                        let fresh = get_enrollment_status();
+                        sr.set_title("Face data enrolled");
+                        sr.set_subtitle(&fresh);
+
                         er.set_title("Re-enroll (Replace Face Data)");
                         er.set_subtitle("Delete existing data and capture 10 fresh samples");
                         er.set_sensitive(true);
@@ -343,6 +364,13 @@ fn build_ui(app: &adw::Application) {
                 EnrollmentUpdate::Error(e) => {
                     instruction.set_label("Enrollment failed");
                     sub_label.set_label(&e);
+
+                    let toast = adw::Toast::builder()
+                        .title(format!("Enrollment failed: {e}"))
+                        .timeout(5)
+                        .build();
+                    toast_overlay.add_toast(toast);
+
                     let (s, er, ar) = (stack.clone(), enroll_row.clone(), add_row.clone());
                     glib::timeout_add_seconds_local(3, move || {
                         er.set_sensitive(true);
@@ -372,6 +400,8 @@ fn build_ui(app: &adw::Application) {
         let er2      = enroll_row.clone();
         let ar2      = add_more_row.clone();
         let dr2      = delete_row.clone();
+        let sr2      = status_row.clone();
+        let to2      = toast_overlay.clone();
         enroll_row.connect_activated(move |row| {
             stack2.set_visible_child_name("enroll");
             let do_delete = row.title().as_str().starts_with("Re-enroll");
@@ -381,7 +411,8 @@ fn build_ui(app: &adw::Application) {
             start_enrollment(tx, rx, do_delete,
                 pic2.clone(), instr2.clone(), sub2.clone(),
                 prog2.clone(), ctr2.clone(), stack2.clone(),
-                er2.clone(), ar2.clone(), dr2.clone());
+                er2.clone(), ar2.clone(), dr2.clone(),
+                sr2.clone(), to2.clone());
         });
     }
 
@@ -396,6 +427,8 @@ fn build_ui(app: &adw::Application) {
         let er3      = enroll_row.clone();
         let ar3      = add_more_row.clone();
         let dr3      = delete_row.clone();
+        let sr3      = status_row.clone();
+        let to3      = toast_overlay.clone();
         add_more_row.connect_activated(move |row| {
             stack3.set_visible_child_name("enroll");
             row.set_sensitive(false);
@@ -404,7 +437,8 @@ fn build_ui(app: &adw::Application) {
             start_enrollment(tx, rx, false,
                 pic3.clone(), instr3.clone(), sub3.clone(),
                 prog3.clone(), ctr3.clone(), stack3.clone(),
-                er3.clone(), ar3.clone(), dr3.clone());
+                er3.clone(), ar3.clone(), dr3.clone(),
+                sr3.clone(), to3.clone());
         });
     }
 
