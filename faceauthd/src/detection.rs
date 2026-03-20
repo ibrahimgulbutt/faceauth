@@ -63,7 +63,8 @@ impl FaceDetector {
         // For a security daemon doing <20 inferences/day, Level1 startup is far better.
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level1)?
-            .with_intra_threads(intra_threads)?
+            .with_intra_threads(intra_threads)?     // parallel work within one node
+            .with_inter_threads(intra_threads)?     // parallel scheduling between nodes
             .with_parallel_execution(false)?
             .commit_from_file(final_path)?;
         

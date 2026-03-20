@@ -9,14 +9,20 @@ Restart=always
 RestartSec=5
 User=root
 Group=root
-# Performance Tuning
-# Prevent swapping to ensure fast wake-up after sleep
+# Prevent swapping — ensures fast wake-up after sleep
 MemorySwapMax=0
-# Reduce memory fragmentation and virtual memory overhead
+# Run below normal scheduling priority so ONNX inference doesn't
+# starve the compositor/desktop on resume from sleep.
+Nice=10
+CPUSchedulingPolicy=batch
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+# Reduce memory fragmentation
 Environment=MALLOC_ARENA_MAX=2
-# Cap ONNX Runtime / OpenMP / Intel MKL thread pools to 1 thread.
-# Without this, int8 ONNX models spawn a thread per CPU core (8 threads on this machine)
-# regardless of session-level intra_threads setting, causing the CPU spike on every login.
+# Cap ALL ONNX / OpenMP / MKL thread pools to 1.
+# Without this, int8 ONNX models still spawn a thread per CPU core
+# via OMP/MKL *even when* intra_threads=1 is set in the session,
+# causing the CPU spike on every login and especially after sleep.
 Environment=OMP_NUM_THREADS=1
 Environment=MKL_NUM_THREADS=1
 Environment=OPENBLAS_NUM_THREADS=1

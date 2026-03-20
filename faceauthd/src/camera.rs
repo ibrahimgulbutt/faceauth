@@ -40,6 +40,12 @@ impl CameraManager {
         let mut cam = Camera::new(self.index.clone(), self.requested.clone())
             .context("Failed to create camera instance")?;
         cam.open_stream().context("Failed to open camera stream")?;
+        // Give V4L2 time to flush stale frames from the internal buffer and
+        // let the auto-exposure/gain converge.  Without this, the first few
+        // decoded frames after a long idle (30+ minutes) are dark or blurry,
+        // which causes detection to fail and triggers an immediate PAM retry
+        // loop — amplifying CPU load.
+        std::thread::sleep(std::time::Duration::from_millis(200));
         info!("Camera stream opened successfully.");
         Ok(ActiveCamera { camera: cam })
     }

@@ -57,7 +57,8 @@ impl FaceEngine {
                 Ok(builder) => {
                     match builder
                         .with_optimization_level(GraphOptimizationLevel::Level1)
-                        .and_then(|b| b.with_intra_threads(intra_threads))
+                        .and_then(|b| b.with_intra_threads(intra_threads))   // parallel within node
+                        .and_then(|b| b.with_inter_threads(intra_threads))   // parallel between nodes
                         .and_then(|b| b.with_parallel_execution(false))
                         .and_then(|b| b.commit_from_file(final_path)) 
                     {

@@ -1,6 +1,7 @@
 use faceauth_core::{AuthRequest, AuthResponse, SOCKET_PATH};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Semaphore;
 use std::fs;
 use std::path::Path;
 use anyhow::Result;
@@ -141,6 +142,12 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Auth semaphore: only ONE authentication pipeline runs at a time.
+    // Without this, PAM retries or simultaneous login attempts each spawn their
+    // own ONNX inference, which fight for the same CPU cores and cause the
+    // 100% CPU burst on failure or after wake-from-sleep.
+    let auth_semaphore = Arc::new(Semaphore::new(1));
+
     if Path::new(SOCKET_PATH).exists() {
         fs::remove_file(SOCKET_PATH)?;
     }
@@ -163,9 +170,10 @@ async fn main() -> Result<()> {
                 let storage_clone = storage.clone();
                 let config_clone = config.clone();
                 let rate_limiter_clone = rate_limiter.clone();
+                let semaphore_clone = auth_semaphore.clone();
                 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, cam_clone, detector_clone, engine_clone, storage_clone, config_clone, rate_limiter_clone).await {
+                    if let Err(e) = handle_client(stream, cam_clone, detector_clone, engine_clone, storage_clone, config_clone, rate_limiter_clone, semaphore_clone).await {
                         error!("Error handling client: {}", e);
                     }
                 });
@@ -184,7 +192,8 @@ async fn handle_client(
     engine: Arc<FaceEngine>,
     storage: Arc<SecureStorage>,
     config: Arc<Config>,
-    rate_limiter: Arc<RateLimiter>
+    rate_limiter: Arc<RateLimiter>,
+    auth_semaphore: Arc<Semaphore>,
 ) -> Result<()> {
     loop {
         // Read length prefix
@@ -395,6 +404,22 @@ async fn handle_client(
                     warn!("Authentication rejected by rate limiter for user {}", user);
                     return send_response(&mut stream, AuthResponse::Failure).await;
                 }
+
+                // Acquire semaphore — only 1 auth pipeline at a time.
+                // If another auth is already running (PAM retry storm, simultaneous
+                // logins), wait up to 10s for it to finish rather than spawning a
+                // competing ONNX session.
+                let _auth_permit = match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    auth_semaphore.acquire(),
+                ).await {
+                    Ok(Ok(permit)) => permit,
+                    _ => {
+                        warn!("Auth semaphore timeout for user {} — another auth is running", user);
+                        return send_response(&mut stream, AuthResponse::Failure).await;
+                    }
+                };
+                // _auth_permit is dropped (released) at the end of this block
                 
                 // 1. Load user profile
                 let profile = match storage.load_user(&user) {

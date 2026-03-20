@@ -63,7 +63,7 @@ impl Default for Config {
                 weak_match_threshold: 0.35,
             },
             camera: CameraConfig {
-                warmup_frames: 2,
+                warmup_frames: 5,   // 5 frames needed after sleep for auto-exposure to settle
                 sequence_length: 5,
                 sequence_interval_ms: 40,
             },

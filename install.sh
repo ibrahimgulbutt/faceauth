@@ -230,6 +230,10 @@ RestartSec=5
 User=root
 Group=root
 MemorySwapMax=0
+Nice=10
+CPUSchedulingPolicy=batch
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
 Environment=MALLOC_ARENA_MAX=2
 Environment=OMP_NUM_THREADS=1
 Environment=MKL_NUM_THREADS=1
@@ -306,7 +310,7 @@ strong_match_threshold = 0.65
 weak_match_threshold = 0.45
 
 [camera]
-warmup_frames = 3
+warmup_frames = 5
 sequence_length = 5
 sequence_interval_ms = 40
 
