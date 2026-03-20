@@ -300,16 +300,16 @@ fn run_enrollment_process(tx: glib::Sender<EnrollmentUpdate>, delete_first: bool
     // The daemon rejects duplicates (cosine > 0.95) so slightly different angles are needed.
     const TARGET_SAMPLES: usize = 10;
     let pose_guides = [
-        "Look straight at the camera",        // sample 1
-        "Keep looking straight — hold still",  // sample 2 (slight head sway is enough)
-        "Turn your head slightly to the LEFT", // sample 3
-        "Stay turned left",                    // sample 4
-        "Turn your head slightly to the RIGHT",// sample 5
-        "Stay turned right",                   // sample 6
-        "Tilt your chin slightly UP",           // sample 7
-        "Keep chin up",                         // sample 8
-        "Lower your chin slightly DOWN",        // sample 9
-        "Almost done — chin down",              // sample 10
+        "Face straight at the camera",   // 1
+        "Hold still",                     // 2
+        "Turn head LEFT",                 // 3
+        "Hold — stay left",               // 4
+        "Turn head RIGHT",                // 5
+        "Hold — stay right",              // 6
+        "Chin UP",                        // 7
+        "Hold — chin up",                 // 8
+        "Chin DOWN",                      // 9
+        "Hold — almost done!",            // 10
     ];
 
     let mut collected = 0usize;
@@ -386,8 +386,10 @@ fn run_enrollment_process(tx: glib::Sender<EnrollmentUpdate>, delete_first: bool
             }
         }
 
-        // Draw colored guide oval on the frame (green = face OK, red = no face)
-        let mut display_frame = rgb_frame.clone();
+        // Mirror the display frame so the preview behaves like a selfie camera.
+        // The raw rgb_frame (unflipped) has already been sent to the daemon above,
+        // so enrollment and auth embeddings stay consistent.
+        let mut display_frame = image::imageops::flip_horizontal(&rgb_frame);
         draw_guide_oval(&mut display_frame, face_detected);
 
         // Scale down for display (1280×720 → 640×360) to keep UI lightweight
@@ -426,10 +428,6 @@ fn draw_guide_oval(image: &mut ImageBuffer<Rgb<u8>, Vec<u8>>, face_detected: boo
     let y1 = cy.saturating_sub(ry);
     let y2 = (cy + ry).min(h - 1);
     draw_rect(image, x1, y1, x2, y2, color);
-}
-
-fn draw_overlay(image: &mut ImageBuffer<Rgb<u8>, Vec<u8>>) {
-    draw_guide_oval(image, false);
 }
 
 fn draw_rect(image: &mut ImageBuffer<Rgb<u8>, Vec<u8>>, x1: u32, y1: u32, x2: u32, y2: u32, color: [u8; 3]) {
