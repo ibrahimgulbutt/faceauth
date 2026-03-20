@@ -41,6 +41,12 @@ impl SecureStorage {
             let mut key = Key::<Aes256Gcm>::default();
             OsRng.fill_bytes(&mut key);
             fs::write(&key_path, &key)?;
+            // Restrict read access: only the owning user (root when run as daemon)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+            }
             key
         };
 
@@ -113,5 +119,14 @@ impl SecureStorage {
             }
         }
         Ok(results)
+    }
+
+    pub fn delete_user(&self, username: &str) -> Result<()> {
+        let user_dir = self.base_dir.join(username);
+        if user_dir.exists() {
+            fs::remove_dir_all(&user_dir)?;
+            info!("Deleted enrollment data for user {}", username);
+        }
+        Ok(())
     }
 }

@@ -205,7 +205,7 @@ systemctl --user daemon-reload 2>/dev/null || true
 # Install System Service
 cat > faceauth.service << 'EOF'
 [Unit]
-Description=FaceAuth Daemon
+Description=FaceAuth Authentication Daemon
 After=network.target
 
 [Service]
@@ -215,11 +215,12 @@ Restart=always
 RestartSec=5
 User=root
 Group=root
-
-# Performance Tuning
 MemorySwapMax=0
-Nice=-10
 Environment=MALLOC_ARENA_MAX=2
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=ORT_DISABLE_SPINNING=1
 
 [Install]
 WantedBy=multi-user.target
@@ -286,18 +287,16 @@ confidence_threshold = 0.3
 min_face_size = 80
 
 [recognition]
-match_threshold = 0.45
-strong_match = 0.55
-multi_frame_required = 3
-multi_frame_total = 5
+match_threshold = 0.55
+strong_match_threshold = 0.65
+weak_match_threshold = 0.45
 
 [camera]
-warmup_frames = 2
-capture_interval = 40
-resolution = "1280x720"
+warmup_frames = 3
+sequence_length = 5
+sequence_interval_ms = 40
 
 [security]
-use_keyring = false
 require_liveness = true
 max_attempts = 3
 lockout_seconds = 60

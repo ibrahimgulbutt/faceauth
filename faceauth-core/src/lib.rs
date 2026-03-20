@@ -5,6 +5,7 @@ pub enum AuthRequest {
     Authenticate { user: String },
     Enroll { user: String, name: String },
     EnrollSample { user: String, image_data: Vec<u8>, width: u32, height: u32 },
+    DeleteUser { user: String },
     ListEnrolled,
     Ping,
     Benchmark,

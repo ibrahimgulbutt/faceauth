@@ -1,16 +1,8 @@
-<p align="center">
-  <img src="docs/assets/logo.svg" alt="FaceAuth Logo" width="120"/>
-</p>
-
 <h1 align="center">FaceAuth</h1>
 
 <p align="center">
   <strong>Windows Hello for Linux</strong><br>
-  Face authentication in ~1 second. Works with any webcam.
-</p>
-
-<p align="center">
-  <img src="docs/assets/demo.gif" alt="FaceAuth Demo" width="600"/>
+  Face authentication for <code>sudo</code>, GDM, SDDM, and LightDM. Works with any webcam.
 </p>
 
 <p align="center">
@@ -18,7 +10,7 @@
   <a href="#-features">Features</a> •
   <a href="#-how-it-works">How It Works</a> •
   <a href="#-troubleshooting">Troubleshooting</a> •
-  <a href="ARCHITECTURE.md">Documentation</a>
+  <a href="ARCHITECTURE.md">Architecture</a>
 </p>
 
 ---
@@ -30,140 +22,175 @@
 curl -fsSL https://raw.githubusercontent.com/ibrahimgulbutt/faceauth/main/install.sh | bash
 ```
 
-That's it! The installer will:
-- ✅ Check your system compatibility
-- ✅ Install dependencies automatically
-- ✅ Build and install FaceAuth
-- ✅ Set up PAM integration
-- ✅ Start the background service
+The installer will:
+- ✅ Install system dependencies (GTK4, PAM, clang, etc.)
+- ✅ Install Rust toolchain if not present
+- ✅ Build and install all binaries from source
+- ✅ Download AI models (~20 MB)
+- ✅ Create and start the system service
+- ✅ Configure PAM integration (your choice of scope)
 
-**Total time: ~5 minutes**
+**Total time: ~5 minutes** (mostly compilation)
 
 ---
 
 ### Manual Installation
 
-If you prefer to review the installer first:
+If you prefer to review the script before running it:
 ```bash
-# 1. Download
+# Download and inspect
 wget https://raw.githubusercontent.com/ibrahimgulbutt/faceauth/main/install.sh
-
-# 2. Review the script
 cat install.sh
 
-# 3. Run it
+# Run
 bash install.sh
+```
+
+Or build completely from source:
+```bash
+git clone https://github.com/ibrahimgulbutt/faceauth.git
+cd faceauth
+cargo build --release
+# Then follow the installer steps manually
 ```
 
 ---
 
 ## 📸 Getting Started
 
-### Step 1: Enroll Your Face
+### Step 1: Log Out and Back In
 
-After installation, run:
+The installer adds you to the `video` group. That change only takes effect after a new login session.
+
+### Step 2: Enroll Your Face
+
+Launch the enrollment GUI:
 ```bash
 faceauth-gui
 ```
 
-**What to do:**
-1. Look at the camera
-2. Follow on-screen instructions (5 angles)
-3. Click "Enroll"
+The GUI collects **10 confirmed face samples** across different angles so the model learns your face robustly. You will see a guide oval — keep your face inside it and follow the on-screen angle prompts.
 
-**Takes ~30 seconds**
+**Enrollment buttons:**
 
-### Step 2: Test It
+| Button | What it does |
+|--------|-------------|
+| **Enroll My Face** (first time) | Captures 10 samples and saves your face data |
+| **Re-enroll (Replace)** | Deletes existing data and re-captures 10 fresh samples |
+| **Add More Angles** | Appends 10 more samples to your existing enrollment (improves accuracy) |
+| **Delete Enrollment** | Removes all your face data |
+
+**Takes ~1 minute** the first time.
+
+### Step 3: Test It
 ```bash
 sudo echo "Hello FaceAuth!"
 ```
 
-The camera will activate and authenticate you automatically. No password needed! ✨
+The camera activates, recognises you, and unlocks — no password needed. ✨
 
 ---
 
 ## ✨ Features
 
 ### 🚀 Fast
-- **~1 second** authentication (comparable to Windows Hello)
-- Faster than typing your password (avg: 2-3 seconds)
-- Much faster than Howdy (2-3 seconds)
+- **~1 second** end-to-end authentication on typical hardware
+- Camera warms up in the background while PAM starts
+- Much faster than Howdy (2–3 s)
 
 ### 🔒 Secure
-- **No photos stored** - only mathematical embeddings
-- **AES-256-GCM encryption** for face data
-- **Liveness detection** prevents photo attacks
-- **Rate limiting** prevents brute-force attempts
-- **Audit logging** tracks all authentication attempts
+- **No photos stored** — only 512-number ArcFace embeddings
+- **AES-256-GCM** encrypted face data at rest
+- **Liveness detection** — rejects printed photos and replays
+- **Rate limiting** with configurable lockout after failed attempts
+- **Audit logging** for every authentication event
 
 ### 🐧 Native Linux
-- Works with **any webcam** (no special hardware)
+- Works with **any V4L2 webcam** — no proprietary drivers
 - Supports **Wayland and X11**
-- Integrates with **sudo, GDM, SDDM, LightDM**
-- Compatible with **Ubuntu, Fedora, Arch, Debian**
+- PAM module integrates with **sudo, GDM, SDDM, LightDM**
+- Tested on **Ubuntu 22.04+, Fedora 38+, Arch Linux, Debian 12**
 
 ### 🎨 User-Friendly
-- **GTK4 GUI** for easy enrollment
-- **Automatic fallback** to password if face auth fails
-- **Won't lock you out** - password always works
-- **Clear error messages** and diagnostics
+- **GTK4/Adwaita GUI** for enrollment with live camera preview
+- **Automatic fallback** to password if face auth fails or is unavailable
+- **Never locks you out** — password always works as a fallback
 
 ---
 
 ## 🎯 How It Works
-1. You run sudo
-2. Camera activates
-3. AI detects your face (~360ms)
-4. AI recognizes you (~187ms)
-5. System unlocks (~1.1s total)
 
+```
+You run: sudo <command>
+         ↓
+PAM calls pam_faceauth.so
+         ↓
+Daemon opens camera → warms up (3 frames discarded)
+         ↓
+ScrFD detects face in frame 0 (~360 ms)
+         ↓
+ArcFace embeds 5 crops and averages them (~187 ms)
+         ↓
+Cosine similarity vs stored embeddings
+         ↓
+Pass (≥ 0.55) → unlocked  |  Fail → password prompt
+```
 
-**Technology:**
-- Face Detection: SCRFD (lightweight, accurate)
-- Face Recognition: ArcFace + MobileFaceNet
-- Runtime: ONNX with INT8 quantization
-- Language: Rust (memory-safe, fast)
+**Technology stack:**
+| Component | Implementation |
+|-----------|---------------|
+| Detection | ScrFD 500M (INT8 quantized) |
+| Recognition | ArcFace / MobileFaceNet (INT8 quantized) |
+| Runtime | ONNX Runtime |
+| Language | Rust — memory-safe, no GC pauses |
+| IPC | Unix socket (`/tmp/faceauth.sock`) |
 
-[📖 Read detailed architecture](ARCHITECTURE.md)
+[📖 Read the detailed architecture](ARCHITECTURE.md)
 
 ---
 
 ## 📊 Performance
 
-**Real-World Benchmarks:**
-- Average Authentication Time: ~1.1 seconds
-- Best Case: ~1.0 second
-- Worst Case: ~1.3 seconds
+**Measured on Intel i5 laptop, USB 2.0 webcam:**
 
-**Components:**
-- Camera Init:    ~950ms  (hardware bottleneck)
-- Face Detection: ~360ms  (overlapped with init)
-- Recognition:    ~187ms  (parallel processing)
+| Stage | Time |
+|-------|------|
+| Camera open + warmup | ~950 ms (hardware) |
+| Face detection (ScrFD) | ~360 ms |
+| Face recognition ×5 (ArcFace) | ~187 ms |
+| **Total (typical)** | **~1.1 s** |
 
-**How We Compare:**
+**Comparison:**
 
 | System | Time | Hardware Required |
 |--------|------|------------------|
-| **FaceAuth** | **~1.1s** | Any webcam |
-| Windows Hello (RGB) | 1.2-1.8s | Any webcam |
-| Windows Hello (IR) | 0.4-0.6s | IR camera |
-| Face ID | 0.6-1.0s | TrueDepth sensor |
-| Howdy | 2.0-3.5s | Any webcam |
+| **FaceAuth** | **~1.1 s** | Any webcam |
+| Windows Hello (RGB) | 1.2–1.8 s | Any webcam |
+| Windows Hello (IR) | 0.4–0.6 s | IR camera required |
+| Howdy | 2.0–3.5 s | Any webcam |
 
 ---
 
 ## 🛠️ Commands
+
 ```bash
-# Check if daemon is running
+# Check daemon and system health
+faceauth doctor
+
+# List enrolled users
+faceauth list
+
+# Re-enroll or manage your face data
+faceauth-gui
+
+# Run a recognition benchmark
+faceauth benchmark
+
+# Daemon control
 sudo systemctl status faceauth.service
+sudo systemctl restart faceauth.service
 
-# List enrolled faces
-sudo faceauth list
-
-# Remove a face model
-sudo faceauth remove <username>
-
-# View logs
+# Live logs
 sudo journalctl -u faceauth.service -f
 ```
 
@@ -172,19 +199,29 @@ sudo journalctl -u faceauth.service -f
 ## 🔧 Configuration
 
 Config file: `/etc/faceauth/config.toml`
-```toml
-[recognition]
-match_threshold = 0.45  # Lower = more lenient (0.4-0.5 recommended)
 
-[security]
-require_liveness = true  # Anti-spoofing (recommended)
-max_attempts = 3         # Attempts before lockout
+```toml
+[detection]
+confidence_threshold = 0.3   # Detection sensitivity (lower = finds more faces)
+min_face_size = 80            # Minimum face size in pixels
+
+[recognition]
+match_threshold = 0.55        # Cosine similarity required to pass (0.5–0.65 range)
+strong_match_threshold = 0.65 # Threshold for a high-confidence match
+weak_match_threshold = 0.45   # Threshold for a weak/tentative match
 
 [camera]
-warmup_frames = 2        # Balance speed vs stability
+warmup_frames = 3             # Frames to discard on open (reduce motion blur)
+sequence_length = 5           # Number of frames to embed and average
+sequence_interval_ms = 40     # Delay between captured frames
+
+[security]
+require_liveness = true       # Reject photo attacks
+max_attempts = 3              # Failed attempts before lockout
+lockout_seconds = 60          # Lockout duration
 ```
 
-After changing config:
+After editing, apply changes with:
 ```bash
 sudo systemctl restart faceauth.service
 ```
@@ -195,105 +232,102 @@ sudo systemctl restart faceauth.service
 
 ### Camera not detected
 ```bash
-# Check if camera exists
-ls /dev/video*
-
-# Test camera
-mpv /dev/video0
-
-# Daemon runs as root, so user permissions issues are rare
-# But you can check if restricted:
-ls -l /dev/video0
+ls /dev/video*         # Check devices exist
+mpv /dev/video0        # Test camera works
+sudo journalctl -u faceauth.service -f  # Check daemon errors
 ```
 
-### Authentication fails
+### Authentication always fails
 ```bash
-# Run diagnostics
-sudo faceauth doctor
+# 1. Run the system health check
+faceauth doctor
 
-# Check logs
-sudo journalctl -u faceauth.service --since "5 minutes ago"
+# 2. Check recent daemon activity
+sudo journalctl -u faceauth.service --since "10 minutes ago"
 
-# Re-enroll face
-faceauth-gui
+# 3. Re-enroll with more angles
+faceauth-gui   # Use "Re-enroll" or "Add More Angles"
 ```
+
+If logs show a score of `0.35–0.48` consistently, lower `match_threshold` to `0.45` in the config, or re-enroll using more varied angles.
 
 ### Daemon won't start
 ```bash
-# Check status
-sudo systemctl status faceauth.service
-
-# View errors
-sudo journalctl -u faceauth.service -f
-
-# Restart daemon
-sudo systemctl restart faceauth.service
+sudo systemctl status faceauth.service   # Check for errors
+sudo journalctl -u faceauth.service -f   # View full output
 ```
 
-### Still having issues?
-1. Run `faceauth doctor` and share output
-2. Open an issue: [GitHub Issues](https://github.com/ibrahimgulbutt/faceauth/issues)
-3. Include: OS version, camera model, error logs
+Common causes: ONNX model files missing from `/usr/share/faceauth/models/`, or a previous user-level service conflict. Run `faceauth doctor` for a full check.
+
+### Still stuck?
+1. Run `faceauth doctor` and copy the output
+2. Open an issue: [github.com/ibrahimgulbutt/faceauth/issues](https://github.com/ibrahimgulbutt/faceauth/issues)
+3. Include: OS + version, webcam model, daemon logs
 
 ---
 
 ## 🔓 Uninstalling
-```bash
-# Download uninstaller
-curl -fsSL https://raw.githubusercontent.com/ibrahimgulbutt/faceauth/main/uninstall.sh | bash
 
-# Or manually:
-systemctl --user stop faceauth.service
-sudo rm /usr/local/bin/faceauth*
-sudo rm /lib/security/pam_faceauth.so
-sudo rm /etc/pam.d/sudo  # Edit to remove faceauth line
+```bash
+# Stop and disable the service
+sudo systemctl stop faceauth.service
+sudo systemctl disable faceauth.service
+
+# Remove binaries
+sudo rm -f /usr/local/bin/faceauthd /usr/local/bin/faceauth /usr/local/bin/faceauth-gui
+
+# Remove PAM module
+sudo rm -f /lib/x86_64-linux-gnu/security/pam_faceauth.so \
+           /usr/lib/security/pam_faceauth.so \
+           /lib/security/pam_faceauth.so
+
+# Remove service and config
+sudo rm -f /etc/systemd/system/faceauth.service
+sudo rm -rf /etc/faceauth /usr/share/faceauth
+
+# Remove from PAM (edit manually and delete the pam_faceauth.so line)
+sudo nano /etc/pam.d/sudo
+
+sudo systemctl daemon-reload
 ```
 
 ---
 
 ## 🤝 Contributing
 
-Contributions welcome! See [CONTRIBUTING.md](docs/CONTRIBUTING.md)
+Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Ways to help:**
-- 🐛 Report bugs
-- 💡 Suggest features  
+- 🐛 Report bugs with logs and system info
+- 💡 Suggest features via GitHub Issues
 - 📖 Improve documentation
-- 🔧 Submit pull requests
+- 🔧 Submit pull requests (please read CONTRIBUTING.md first)
 - ⭐ Star the project
 
 ---
 
 ## 🔐 Security
 
-- **No photos stored** - only 512-number mathematical vectors
-- **Encrypted storage** - AES-256-GCM
-- **Open source** - audit the code yourself
-- **Privacy-first** - no telemetry, no cloud
+- **No photos or video stored** — only 512-dimensional cosine vectors
+- **AES-256-GCM** encrypted at rest with a per-user key
+- **Open source** — read and audit every line
+- **No telemetry, no cloud** — fully offline operation
 
-[📖 Read security model](docs/SECURITY.md)
-
-Found a security issue? Email: security@yourproject.com
+Found a security issue? Please open a [private security advisory](https://github.com/ibrahimgulbutt/faceauth/security/advisories/new) on GitHub.
 
 ---
 
 ## 📄 License
 
-MIT License - see [LICENSE](LICENSE)
+MIT License — see [LICENSE](LICENSE).
 
 ---
 
 ## 🙏 Acknowledgments
 
-- [SCRFD](https://github.com/deepinsight/insightface/tree/master/detection/scrfd) - Face detection
-- [ArcFace](https://github.com/deepinsight/insightface/tree/master/recognition/arcface_torch) - Face recognition
-- Inspired by Windows Hello and Face ID
-
----
-
-## ⭐ Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=ibrahimgulbutt/faceauth&type=Date)](https://star-history.com/#ibrahimgulbutt/faceauth&Date)
+- [SCRFD](https://github.com/deepinsight/insightface/tree/master/detection/scrfd) — face detection model
+- [ArcFace](https://github.com/deepinsight/insightface/tree/master/recognition/arcface_torch) — face recognition model
+- Inspired by Windows Hello and [Howdy](https://github.com/boltgolt/howdy)
 
 ---
 
@@ -304,5 +338,5 @@ MIT License - see [LICENSE](LICENSE)
 <p align="center">
   <a href="https://github.com/ibrahimgulbutt/faceauth">GitHub</a> •
   <a href="https://github.com/ibrahimgulbutt/faceauth/issues">Issues</a> •
-  <a href="docs/CONTRIBUTING.md">Contributing</a>
+  <a href="CONTRIBUTING.md">Contributing</a>
 </p>

@@ -31,3 +31,10 @@ buffalo_sc.zip
 
 # Local configuration
 .env
+
+# Development scratch files
+temp_logs.txt
+checkpoints/
+next_plan.md
+project_explanation.md
+quantize.py

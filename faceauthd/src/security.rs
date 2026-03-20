@@ -36,9 +36,12 @@ impl RateLimiter {
                     warn!("Rate limit exceeded for user {}. Locked out for {:?}s", user, (self.lockout_duration - last_time.elapsed()).as_secs());
                     return false;
                 } else {
-                    // Lockout expired, reset
+                    // Hard lockout expired, reset
                     attempts.remove(user);
                 }
+            } else if last_time.elapsed() > self.lockout_duration {
+                // Partial-failure entry that's stale — prune to avoid unbounded growth
+                attempts.remove(user);
             }
         }
         true

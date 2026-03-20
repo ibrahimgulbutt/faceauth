@@ -6,7 +6,6 @@ use ort::value::Value;
 use std::path::Path;
 use std::sync::Mutex;
 use log::{info, error, warn};
-use imageproc::contrast::equalize_histogram;
 
 
 // Constants for ArcFace (MobileFaceNet)
@@ -57,7 +56,7 @@ impl FaceEngine {
             match Session::builder() {
                 Ok(builder) => {
                     match builder
-                        .with_optimization_level(GraphOptimizationLevel::Level3)
+                        .with_optimization_level(GraphOptimizationLevel::Level1)
                         .and_then(|b| b.with_intra_threads(intra_threads))
                         .and_then(|b| b.with_parallel_execution(false))
                         .and_then(|b| b.commit_from_file(final_path)) 
@@ -82,25 +81,19 @@ impl FaceEngine {
         })
     }
 
-    /// Preprocess image for ArcFace: Resize to 112x112, Normalize
+    /// Preprocess image for ArcFace: Resize to 112x112, normalize per-channel (RGB).
+    /// ArcFace standard: normalize each pixel to (value - 127.5) / 128.0 for all 3 channels.
+    /// Do NOT convert to grayscale — ArcFace requires full RGB input.
     fn preprocess(&self, image: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<Array4<f32>> {
-        let resized = image::imageops::resize(image, INPUT_SIZE.0, INPUT_SIZE.1, image::imageops::FilterType::Triangle);
+        let resized = image::imageops::resize(image, INPUT_SIZE.0, INPUT_SIZE.1, image::imageops::FilterType::CatmullRom);
         
-        // Histogram Equalization to improve low-light performance
-        let gray = image::imageops::grayscale(&resized);
-        let equalized = equalize_histogram(&gray);
-
         let mut array = Array::zeros((1, 3, INPUT_SIZE.1 as usize, INPUT_SIZE.0 as usize));
         
-        // Standard Iterator Optimization (LLVM will auto-vectorize this)
-        // Normalize: (x - 127.5) / 128.0
-        for (i, p) in equalized.pixels().enumerate() {
-            let val = (p.0[0] as f32 - 127.5) / 128.0;
-            let x = i % INPUT_SIZE.0 as usize;
-            let y = i / INPUT_SIZE.0 as usize;
-            array[[0, 0, y, x]] = val;
-            array[[0, 1, y, x]] = val;
-            array[[0, 2, y, x]] = val;
+        for (x, y, pixel) in resized.enumerate_pixels() {
+            let [r, g, b] = pixel.0;
+            array[[0, 0, y as usize, x as usize]] = (r as f32 - 127.5) / 128.0;
+            array[[0, 1, y as usize, x as usize]] = (g as f32 - 127.5) / 128.0;
+            array[[0, 2, y as usize, x as usize]] = (b as f32 - 127.5) / 128.0;
         }
         
         Ok(array)

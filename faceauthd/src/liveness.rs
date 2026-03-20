@@ -20,9 +20,9 @@ pub fn check_liveness(frames: &[RgbImage]) -> bool {
     info!("Liveness score (avg frame diff): {:.5}", avg_diff);
 
     // Thresholds:
-    // Too low (< 0.005): Likely a static photo
+    // Too low (< 0.002): Likely a static photo (was 0.005 - too strict, caused false failures)
     // Too high (> 0.15): Likely excessive movement or lighting changes
-    if avg_diff > 0.005 && avg_diff < 0.15 {
+    if avg_diff > 0.002 && avg_diff < 0.15 {
         true
     } else {
         warn!("Liveness check failed. Score: {:.5}", avg_diff);

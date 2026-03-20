@@ -5,8 +5,7 @@ use std::fs;
 use std::path::Path;
 use anyhow::Result;
 use log::{info, error, warn};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 mod camera;
 mod recognition;
@@ -225,7 +224,10 @@ async fn handle_client(
 
                 tokio::spawn(async move {
                     let res = tokio::task::spawn_blocking(move || {
-                        let mut cam_mgr = futures::executor::block_on(camera_clone.lock());
+                        let cam_mgr = match camera_clone.lock() {
+                            Ok(g) => g,
+                            Err(poisoned) => { warn!("Camera mutex poisoned, recovering"); poisoned.into_inner() }
+                        };
                         let mut active_cam = cam_mgr.start_session()?;
                         active_cam.warmup(config_clone.camera.warmup_frames)?;
                         let frame0 = active_cam.capture_frame()?;
@@ -374,6 +376,17 @@ async fn handle_client(
                 }
             },
 
+            AuthRequest::DeleteUser { user } => {
+                info!("Deleting enrollment data for user: {}", user);
+                match storage.delete_user(&user) {
+                    Ok(_) => AuthResponse::Success,
+                    Err(e) => {
+                        error!("Failed to delete user {}: {}", user, e);
+                        AuthResponse::Failure
+                    }
+                }
+            },
+
             AuthRequest::Authenticate { user } => {
                 info!("Authenticating user: {}", user);
 
@@ -415,7 +428,10 @@ async fn handle_client(
                     // Move into blocking thread for I/O
                     let res = tokio::task::spawn_blocking(move || {
                         // Acquire lock inside blocking task
-                        let mut cam_mgr = futures::executor::block_on(camera_clone.lock());
+                        let cam_mgr = match camera_clone.lock() {
+                            Ok(g) => g,
+                            Err(poisoned) => { warn!("Camera mutex poisoned, recovering"); poisoned.into_inner() }
+                        };
                         
                         // Start Session
                         // Solid Solution Fix: Retry logic for wake-from-sleep race condition
@@ -474,10 +490,12 @@ async fn handle_client(
                 };
 
                 // Step 3b: Start Detection on Frame 0 (Async/Parallel)
+                // Returns a tight face crop AND the bounding box so we can crop frames 1-N
+                // by propagating the bbox (face doesn't move significantly in ~200ms).
                 let detector_clone = detector.clone();
                 let frame0_for_detect = frame0.clone();
                 let detection_task = tokio::task::spawn_blocking(move || {
-                    detector_clone.detect(&frame0_for_detect)
+                    detector_clone.detect_with_bbox(&frame0_for_detect)
                 });
 
                 // Step 3c: Wait for Camera Task to Finish (Remaining frames)
@@ -515,25 +533,17 @@ async fn handle_client(
                 let detection_result = detection_task.await;
 
                 let mut crops = Vec::new();
-                
-                if let Ok(Ok(Some(face0))) = detection_result {
-                    crops.push(face0);
-                    
-                    // Step 3e: Adaptive - Use center crop for remaining frames (Parallelized)
-                    let mut crop_tasks = Vec::new();
-                    for i in 1..frames.len() {
-                        let detector_clone = detector.clone();
-                        let frame = frames[i].clone();
-                        crop_tasks.push(tokio::task::spawn_blocking(move || {
-                            detector_clone.get_center_crop(&frame)
-                        }));
-                    }
 
-                    let crop_results = futures::future::join_all(crop_tasks).await;
-                    for res in crop_results {
-                        if let Ok(c) = res {
-                            crops.push(c);
-                        }
+                if let Ok(Ok(Some((face0, bbox0)))) = detection_result {
+                    crops.push(face0);
+
+                    // Step 3e: Crop frames 1-N using the propagated bbox from frame 0.
+                    // Equivalent to face tracking: the face doesn't move more than a few pixels
+                    // across the 200ms capture window, so the bbox is still accurate.
+                    // This gives tight face crops (vs. 720×720 center squares) for all frames,
+                    // dramatically improving ArcFace embedding quality.
+                    for i in 1..frames.len() {
+                        crops.push(detector.crop_from_bbox(&frames[i], &bbox0));
                     }
                 } else {
                     warn!("No face detected in first frame. Aborting sequence.");
@@ -542,22 +552,20 @@ async fn handle_client(
                     return send_response(&mut stream, AuthResponse::Failure).await;
                 }
 
-                // Step 4: Parallel Recognition
-                let mut tasks = Vec::new();
-                for crop in crops {
-                    let engine_clone = engine.clone();
-                    tasks.push(tokio::task::spawn_blocking(move || {
-                        engine_clone.get_embedding(&crop)
-                    }));
-                }
+                // Step 4: Sequential Recognition in a single blocking thread.
+                // The ONNX session is Mutex-locked — running 5 spawn_blocking tasks in parallel
+                // just creates 5 idle threads competing for one lock (heap explosion, zero benefit).
+                // One thread doing 5 sequential inferences is faster and uses 8MB stack instead of 40MB.
+                let engine_for_rec = engine.clone();
+                let recognition_results = tokio::task::spawn_blocking(move || {
+                    crops.into_iter().map(|crop| engine_for_rec.get_embedding(&crop)).collect::<Vec<_>>()
+                }).await.unwrap_or_default();
 
-                let results = futures::future::join_all(tasks).await;
-                
                 let mut valid_matches = 0;
                 let mut best_score = 0.0;
 
-                for res in results {
-                    if let Ok(Ok(current_embedding)) = res {
+                for res in recognition_results {
+                    if let Ok(current_embedding) = res {
                         // 5. Compare with stored embeddings
                         let mut max_score = 0.0;
                         for stored_emb in &profile.embeddings {

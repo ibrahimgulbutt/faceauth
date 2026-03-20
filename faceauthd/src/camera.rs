@@ -27,14 +27,9 @@ impl CameraManager {
     }
 
     pub fn initialize(&mut self) -> Result<()> {
-        info!("Initializing camera manager...");
-        // We don't create the Camera instance here anymore to avoid holding the lock/LED.
-        // We just verify we can create it.
-        {
-            let _cam = Camera::new(self.index.clone(), self.requested.clone())
-                .context("Failed to verify camera access")?;
-        }
-        info!("Camera manager initialized (lazy mode)");
+        // Don't open the camera at startup — that would flash the LED immediately on boot
+        // with no benefit.  start_session() will catch any real camera error on first use.
+        info!("Camera manager initialized (camera opened on-demand)");
         Ok(())
     }
 
