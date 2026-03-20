@@ -2,12 +2,22 @@ use clap::{Parser, Subcommand};
 use faceauth_core::{AuthRequest, AuthResponse, SOCKET_PATH};
 use std::os::unix::net::UnixStream;
 use std::io::{Read, Write};
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "faceauth")]
-#[command(about = "CLI for FaceAuth system", long_about = None)]
+#[command(version)]
+#[command(about = "FaceAuth — face authentication for Linux", long_about = "\
+FaceAuth lets you log in to sudo, GDM, SDDM and LightDM with your face.
+
+QUICK START
+  1. Enroll your face (GUI):      faceauth-gui
+  2. Test authentication:         faceauth test --user $USER
+  3. Check system health:         faceauth doctor
+
+The daemon (faceauthd) must be running. Check with:  faceauth ping
+Service logs:  sudo journalctl -u faceauth.service -f")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -15,23 +25,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Ping the daemon to check connectivity
+    /// Check daemon connectivity (returns 'pong' if running)
     Ping,
-    /// Enroll a new face for the current user
-    Enroll {
-        #[arg(short, long)]
-        name: String,
-    },
-    /// List all enrolled users and their face counts
+    /// List all enrolled users and their face-sample counts
     List,
-    /// Test authentication for a user
+    /// Test face authentication for a user (opens the camera)
     Test {
-        #[arg(short, long)]
+        /// Username to authenticate (defaults to $USER if omitted)
+        #[arg(short, long, default_value_t = std::env::var("USER").unwrap_or_default())]
         user: String,
     },
-    /// Run system diagnostics
+    /// Run system diagnostics (daemon, camera, PAM, models, config)
     Doctor,
-    /// Run performance benchmark
+    /// Measure detection and recognition pipeline latency
     Benchmark,
 }
 
@@ -137,45 +143,19 @@ fn main() -> Result<()> {
                 _ => println!("Unexpected response: {:?}", response),
             }
         }
-        Commands::Enroll { name } => {
-            println!("NOTE: CLI enrollment is deprecated. Please use the GUI for better results.");
-            println!("Run: faceauth-gui");
-            
-            let user = std::env::var("USER").context("Could not determine current user")?;
-            println!("Enrolling face for user: {} ({})", user, name);
-            
-            let mut stream = UnixStream::connect(SOCKET_PATH)
-                .context("Failed to connect to daemon. Is it running?")?;
-            set_timeout(&mut stream, 60)?;
-            
-            send_request(&mut stream, &AuthRequest::Enroll { user, name })?;
-            let response = read_response(&mut stream)?;
-
-            match response {
-                AuthResponse::EnrollmentStatus { message, progress } => {
-                    if progress >= 1.0 {
-                        println!("Success: {}", message);
-                    } else {
-                        println!("Failed: {}", message);
-                    }
-                },
-                _ => println!("Unexpected response: {:?}", response),
-            }
-        }
         Commands::Test { user } => {
-            println!("Testing authentication for user: {}", user);
+            println!("Testing face authentication for user: {}", user);
+            println!("Look at your camera when it activates…");
             let mut stream = UnixStream::connect(SOCKET_PATH)
-                .context("Failed to connect to daemon. Is it running?")?;
+                .context("Cannot connect to daemon — is faceauthd running? Try: sudo systemctl start faceauth.service")?;
             set_timeout(&mut stream, 20)?;
-            
+
             send_request(&mut stream, &AuthRequest::Authenticate { user: user.clone() })?;
-            
-            println!("Waiting for authentication result (look at camera)...");
             let response = read_response(&mut stream)?;
 
             match response {
-                AuthResponse::Success => println!("Authentication SUCCESS!"),
-                AuthResponse::Failure => println!("Authentication FAILED."),
+                AuthResponse::Success => println!("✓  Authentication SUCCESS for '{}'", user),
+                AuthResponse::Failure => println!("✗  Authentication FAILED for '{}'\n   Tip: re-enroll with more angles using faceauth-gui", user),
                 _ => println!("Unexpected response: {:?}", response),
             }
         }

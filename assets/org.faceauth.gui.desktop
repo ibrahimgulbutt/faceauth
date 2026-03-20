@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=FaceAuth
+GenericName=Face Enrollment
+Comment=Manage face login enrollment for FaceAuth
+Exec=faceauth-gui
+Icon=org.faceauth.gui
+Type=Application
+Categories=System;Security;Settings;
+Keywords=face;login;biometric;authentication;enroll;camera;
+StartupWMClass=faceauth-gui
+StartupNotify=true

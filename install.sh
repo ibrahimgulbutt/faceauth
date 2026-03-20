@@ -190,6 +190,20 @@ PAM_DIR="/lib/x86_64-linux-gnu/security"
 
 sudo install -m 644 target/release/libpam_faceauth.so "$PAM_DIR/pam_faceauth.so"
 
+# Install desktop integration (icon + .desktop file)
+echo
+echo -e "${BLUE}🖼️  Installing desktop integration...${NC}"
+sudo mkdir -p /usr/share/icons/hicolor/scalable/apps
+sudo install -m 644 assets/org.faceauth.gui.svg \
+    /usr/share/icons/hicolor/scalable/apps/org.faceauth.gui.svg
+sudo mkdir -p /usr/share/applications
+sudo install -m 644 assets/org.faceauth.gui.desktop \
+    /usr/share/applications/org.faceauth.gui.desktop
+# Refresh icon cache so launchers pick it up immediately
+sudo gtk-update-icon-cache -qtf /usr/share/icons/hicolor 2>/dev/null || true
+sudo update-desktop-database /usr/share/applications 2>/dev/null || true
+echo -e "${GREEN}✅ Desktop integration installed${NC}"
+
 echo -e "${GREEN}✅ Binaries installed${NC}"
 
 # Setup systemd service (System-wide)

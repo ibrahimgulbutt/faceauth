@@ -1,9 +1,9 @@
 use gtk4::prelude::*;
-use gtk4::{Button, Box, Orientation, Label, ProgressBar, Picture, Stack, AspectFrame};
+use gtk4::{Button, Box, Orientation, Label, ProgressBar, Picture, Stack, AspectFrame,
+           Separator, ScrolledWindow};
 use libadwaita::prelude::*;
 use libadwaita as adw;
 use std::thread;
-use std::sync::{Arc, Mutex};
 use std::os::unix::net::UnixStream;
 use std::io::{Read, Write};
 use faceauth_core::{AuthRequest, AuthResponse, SOCKET_PATH};
@@ -13,13 +13,7 @@ use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
 use nokhwa::Camera;
 use image::{ImageBuffer, Rgb};
 use gtk4::gdk::{Texture, MemoryTexture, MemoryFormat};
-use std::path::Path;
 use std::time::Duration;
-
-// ... imports remain the same ...
-
-// mod detection; // Removed client-side detection
-// use detection::FaceDetector;
 
 const APP_ID: &str = "org.faceauth.gui";
 
@@ -30,153 +24,329 @@ fn main() {
 }
 
 fn build_ui(app: &adw::Application) {
+    // ── Root layout ──────────────────────────────────────────────────────────
     let content = Box::new(Orientation::Vertical, 0);
-    
-    // Header Bar
-    let header_bar = adw::HeaderBar::new();
+
+    let header_bar = adw::HeaderBar::builder()
+        .show_end_title_buttons(true)
+        .build();
     content.append(&header_bar);
 
-    // Main Stack for "Welcome/Status" vs "Enrollment"
+    // Main navigating stack (slides left/right between home and camera page)
     let stack = Stack::new();
     stack.set_transition_type(gtk4::StackTransitionType::SlideLeftRight);
-    
-    // Page 1: Status & Welcome
+    stack.set_transition_duration(250);
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PAGE 1 — Home / Status
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     let enrollment_status = get_enrollment_status();
-    let is_enrolled = !enrollment_status.contains("No users enrolled") 
+    let is_enrolled = !enrollment_status.contains("No users enrolled")
         && !enrollment_status.contains("Daemon not running")
         && !enrollment_status.contains("Failed");
 
-    let status_page = adw::StatusPage::builder()
-        .title("FaceAuth Enrollment")
-        .description(enrollment_status.as_str())
-        .icon_name("camera-web-symbolic")
+    // Scrollable home page so it works on small screens too
+    let scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vexpand(true)
         .build();
 
-    let enroll_btn = Button::builder()
-        .label(if is_enrolled { "Re-enroll (Replace Face Data)" } else { "Enroll My Face" })
-        .css_classes(vec!["suggested-action", "pill"])
-        .halign(gtk4::Align::Center)
-        .margin_bottom(8)
+    let home_box = Box::new(Orientation::Vertical, 0);
+    home_box.set_halign(gtk4::Align::Center);
+    home_box.set_valign(gtk4::Align::Start);
+    home_box.set_margin_top(32);
+    home_box.set_margin_bottom(32);
+    home_box.set_margin_start(24);
+    home_box.set_margin_end(24);
+    home_box.set_spacing(24);
+    home_box.set_size_request(480, -1);
+
+    // ── Hero banner ─────────────────────────────────────────────────────────
+    let hero = Box::new(Orientation::Vertical, 8);
+    hero.set_halign(gtk4::Align::Center);
+
+    let logo_label = Label::new(Some("󰯄")); // nerd font camera icon fallback
+    logo_label.set_css_classes(&["title-1"]);
+
+    let icon_img = gtk4::Image::builder()
+        .icon_name("org.faceauth.gui")
+        .pixel_size(80)
+        .build();
+    // Use the themed icon when available, otherwise fallback to a symbolic
+    if gtk4::IconTheme::for_display(&gtk4::gdk::Display::default().unwrap())
+        .has_icon("org.faceauth.gui")
+    {
+        hero.append(&icon_img);
+    } else {
+        let fallback = gtk4::Image::builder()
+            .icon_name("camera-web-symbolic")
+            .pixel_size(64)
+            .css_classes(vec!["dim-label"])
+            .build();
+        hero.append(&fallback);
+    }
+
+    let title_lbl = Label::builder()
+        .label("FaceAuth")
+        .css_classes(vec!["title-1"])
+        .build();
+    let subtitle_lbl = Label::builder()
+        .label("Face login for Linux")
+        .css_classes(vec!["dim-label", "body"])
+        .build();
+    hero.append(&title_lbl);
+    hero.append(&subtitle_lbl);
+    home_box.append(&hero);
+
+    // ── Status card ─────────────────────────────────────────────────────────
+    let status_card = adw::PreferencesGroup::builder()
+        .title("Enrollment Status")
         .build();
 
-    let add_more_btn = Button::builder()
-        .label("Add More Angles")
-        .css_classes(vec!["pill"])
-        .halign(gtk4::Align::Center)
-        .margin_bottom(8)
+    let status_row = adw::ActionRow::builder()
+        .title(if is_enrolled { "Face data enrolled" } else { "No face enrolled yet" })
+        .subtitle(&enrollment_status)
+        .build();
+    let status_icon = gtk4::Image::builder()
+        .icon_name(if is_enrolled { "emblem-ok-symbolic" } else { "dialog-information-symbolic" })
+        .build();
+    status_row.add_prefix(&status_icon);
+    status_card.add(&status_row);
+    home_box.append(&status_card);
+
+    // ── How it works card (shown only on first run) ──────────────────────────
+    if !is_enrolled {
+        let how_card = adw::PreferencesGroup::builder()
+            .title("How to get started")
+            .description("Enrollment takes about 30 seconds. Follow these 3 steps:")
+            .build();
+
+        let steps = [
+            ("1", "camera-web-symbolic",   "Click Enroll below",          "The camera will open automatically"),
+            ("2", "face-smile-symbolic",   "Position your face",           "Keep your face inside the guide outline"),
+            ("3", "emblem-ok-symbolic",    "Follow the angle prompts",     "Look straight, left, right, up, down"),
+        ];
+        for (_, icon, title, sub) in &steps {
+            let row = adw::ActionRow::builder()
+                .title(*title)
+                .subtitle(*sub)
+                .build();
+            let img = gtk4::Image::builder().icon_name(*icon).build();
+            row.add_prefix(&img);
+            how_card.add(&row);
+        }
+        home_box.append(&how_card);
+    }
+
+    // ── Action buttons ───────────────────────────────────────────────────────
+    let actions_card = adw::PreferencesGroup::builder()
+        .title(if is_enrolled { "Manage Enrollment" } else { "Get Started" })
+        .build();
+
+    // Primary enroll / re-enroll row
+    let enroll_row = adw::ActionRow::builder()
+        .title(if is_enrolled { "Re-enroll (Replace Face Data)" } else { "Enroll My Face" })
+        .subtitle(if is_enrolled {
+            "Delete existing data and capture 10 fresh samples"
+        } else {
+            "Capture 10 face samples across different angles"
+        })
+        .activatable(true)
+        .build();
+    let enroll_chevron = gtk4::Image::builder().icon_name("go-next-symbolic").build();
+    enroll_row.add_suffix(&enroll_chevron);
+    let enroll_icon = gtk4::Image::builder()
+        .icon_name(if is_enrolled { "view-refresh-symbolic" } else { "list-add-symbolic" })
+        .build();
+    enroll_row.add_prefix(&enroll_icon);
+
+    // Add more angles row (only when already enrolled)
+    let add_more_row = adw::ActionRow::builder()
+        .title("Add More Angles")
+        .subtitle("Improve accuracy by adding more face samples")
+        .activatable(true)
         .visible(is_enrolled)
         .build();
+    let add_chevron = gtk4::Image::builder().icon_name("go-next-symbolic").build();
+    add_more_row.add_suffix(&add_chevron);
+    let add_icon = gtk4::Image::builder().icon_name("list-add-symbolic").build();
+    add_more_row.add_prefix(&add_icon);
 
-    let delete_btn = Button::builder()
-        .label("Delete Enrollment")
-        .css_classes(vec!["destructive-action", "pill"])
-        .halign(gtk4::Align::Center)
-        .margin_bottom(20)
+    actions_card.add(&enroll_row);
+    actions_card.add(&add_more_row);
+    home_box.append(&actions_card);
+
+    // ── Danger zone (delete) ─────────────────────────────────────────────────
+    let danger_group = adw::PreferencesGroup::builder()
+        .title("Danger Zone")
+        .build();
+    let delete_row = adw::ActionRow::builder()
+        .title("Delete Enrollment")
+        .subtitle("Remove all stored face data for this user")
+        .activatable(true)
         .visible(is_enrolled)
         .build();
-    
-    let status_box = Box::new(Orientation::Vertical, 12);
-    status_box.append(&status_page);
-    status_box.append(&enroll_btn);
-    status_box.append(&add_more_btn);
-    status_box.append(&delete_btn);
-    stack.add_named(&status_box, Some("status"));
+    let del_icon = gtk4::Image::builder()
+        .icon_name("user-trash-symbolic")
+        .css_classes(vec!["error"])
+        .build();
+    delete_row.add_prefix(&del_icon);
+    danger_group.add(&delete_row);
+    home_box.append(&danger_group);
 
-    // Page 2: Enrollment (Camera)
-    let enroll_box = Box::new(Orientation::Vertical, 12);
-    enroll_box.set_valign(gtk4::Align::Center);
-    enroll_box.set_halign(gtk4::Align::Center);
+    home_box.append(&Separator::new(Orientation::Horizontal)); // bottom breathing room
+
+    scroll.set_child(Some(&home_box));
+    stack.add_named(&scroll, Some("status"));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PAGE 2 — Enrollment Camera View
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    let enroll_outer = Box::new(Orientation::Vertical, 0);
+    enroll_outer.set_vexpand(true);
+
+    // Top strip: step counter + instruction
+    let top_strip = Box::new(Orientation::Vertical, 6);
+    top_strip.set_margin_top(16);
+    top_strip.set_margin_bottom(12);
+    top_strip.set_margin_start(24);
+    top_strip.set_margin_end(24);
 
     let instruction_label = Label::builder()
-        .label("Initializing...")
+        .label("Initializing camera…")
         .css_classes(vec!["title-2"])
+        .halign(gtk4::Align::Center)
+        .wrap(true)
         .build();
-    
-    let progress_bar = ProgressBar::builder()
-        .show_text(true)
-        .fraction(0.0)
+    let sub_label = Label::builder()
+        .label("Keep your face inside the outline")
+        .css_classes(vec!["dim-label"])
+        .halign(gtk4::Align::Center)
         .build();
+    top_strip.append(&instruction_label);
+    top_strip.append(&sub_label);
+    enroll_outer.append(&top_strip);
 
-    // Aspect Frame to keep camera ratio  (16:9 = 1280×720)
+    // Camera preview — fills available width
     let aspect_frame = AspectFrame::builder()
         .xalign(0.5)
         .yalign(0.5)
-        .ratio(16.0/9.0)
+        .ratio(16.0 / 9.0)
         .obey_child(false)
-        .width_request(640)
-        .height_request(360)
+        .hexpand(true)
+        .vexpand(true)
         .build();
-    
     let picture = Picture::builder()
         .can_shrink(true)
         .content_fit(gtk4::ContentFit::Cover)
+        .hexpand(true)
+        .vexpand(true)
         .build();
-    
     aspect_frame.set_child(Some(&picture));
-    
-    enroll_box.append(&instruction_label);
-    enroll_box.append(&aspect_frame);
-    enroll_box.append(&progress_bar);
+    enroll_outer.append(&aspect_frame);
 
-    stack.add_named(&enroll_box, Some("enroll"));
+    // Bottom strip: progress bar + sample counter
+    let bottom_strip = Box::new(Orientation::Vertical, 8);
+    bottom_strip.set_margin_top(12);
+    bottom_strip.set_margin_bottom(20);
+    bottom_strip.set_margin_start(24);
+    bottom_strip.set_margin_end(24);
+
+    let progress_bar = ProgressBar::builder()
+        .show_text(false)
+        .fraction(0.0)
+        .build();
+    progress_bar.set_css_classes(&["osdbar"]);
+
+    let sample_counter = Label::builder()
+        .label("0 / 10 samples")
+        .css_classes(vec!["caption", "dim-label"])
+        .halign(gtk4::Align::Center)
+        .build();
+
+    let cancel_btn = Button::builder()
+        .label("Cancel")
+        .css_classes(vec!["pill"])
+        .halign(gtk4::Align::Center)
+        .build();
+
+    bottom_strip.append(&progress_bar);
+    bottom_strip.append(&sample_counter);
+    bottom_strip.append(&cancel_btn);
+    enroll_outer.append(&bottom_strip);
+
+    stack.add_named(&enroll_outer, Some("enroll"));
     content.append(&stack);
 
-    // Clones for button closures
-    let stack_clone          = stack.clone();
-    let instruction_clone    = instruction_label.clone();
-    let progress_clone       = progress_bar.clone();
-    let picture_clone        = picture.clone();
-    let enroll_btn_clone     = enroll_btn.clone();
-    let enroll_btn_for_del   = enroll_btn.clone();
-    let add_more_btn_clone   = add_more_btn.clone();
-    let add_more_for_enroll  = add_more_btn.clone();
-    let add_more_for_del     = add_more_btn.clone();
-    let delete_btn_clone     = delete_btn.clone();
+    // ── Window ────────────────────────────────────────────────────────────────
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .title("FaceAuth")
+        .default_width(760)
+        .default_height(680)
+        .content(&content)
+        .build();
+    window.present();
 
-    // Shared helper: wire channel to UI and spawn worker.
-    // delete_first=true  → wipe existing data first (Re-enroll)
-    // delete_first=false → keep existing embeddings, add new angles
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Button wiring
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
     fn start_enrollment(
         tx:           glib::Sender<EnrollmentUpdate>,
         rx:           glib::Receiver<EnrollmentUpdate>,
         delete_first: bool,
         picture:      gtk4::Picture,
         instruction:  gtk4::Label,
+        sub_label:    gtk4::Label,
         progress:     gtk4::ProgressBar,
+        counter:      gtk4::Label,
         stack:        gtk4::Stack,
-        enroll_btn:   gtk4::Button,
-        add_more_btn: gtk4::Button,
-        delete_btn:   gtk4::Button,
+        enroll_row:   adw::ActionRow,
+        add_row:      adw::ActionRow,
+        delete_row:   adw::ActionRow,
     ) {
         rx.attach(None, move |msg: EnrollmentUpdate| {
             match msg {
-                EnrollmentUpdate::Frame(tex) => { picture.set_paintable(Some(&tex)); }
-                EnrollmentUpdate::Status(text, frac) => {
-                    instruction.set_label(&text);
+                EnrollmentUpdate::Frame(tex) => {
+                    picture.set_paintable(Some(&tex));
+                }
+                EnrollmentUpdate::Status(main_text, hint, frac) => {
+                    instruction.set_label(&main_text);
+                    sub_label.set_label(&hint);
                     progress.set_fraction(frac as f64);
-                    progress.set_text(Some(&format!("{:.0}%", frac * 100.0)));
+                    let n = (frac * 10.0).round() as u32;
+                    counter.set_label(&format!("{n} / 10 samples"));
                 }
                 EnrollmentUpdate::Success => {
-                    instruction.set_label("Enrollment complete! You can now log in.");
+                    instruction.set_label("All done!");
+                    sub_label.set_label("Face enrollment complete. You can now log in with your face.");
                     progress.set_fraction(1.0);
-                    progress.set_text(Some("Done"));
-                    let (s, eb, ab, db) = (stack.clone(), enroll_btn.clone(), add_more_btn.clone(), delete_btn.clone());
+                    counter.set_label("10 / 10 samples");
+                    let (s, er, ar, dr) = (
+                        stack.clone(),
+                        enroll_row.clone(),
+                        add_row.clone(),
+                        delete_row.clone(),
+                    );
                     glib::timeout_add_seconds_local(2, move || {
-                        eb.set_label("Re-enroll (Replace Face Data)");
-                        eb.set_sensitive(true);
-                        ab.set_visible(true);
-                        ab.set_sensitive(true);
-                        db.set_visible(true);
+                        er.set_title("Re-enroll (Replace Face Data)");
+                        er.set_subtitle("Delete existing data and capture 10 fresh samples");
+                        er.set_sensitive(true);
+                        ar.set_visible(true);
+                        ar.set_sensitive(true);
+                        dr.set_visible(true);
                         s.set_visible_child_name("status");
                         glib::ControlFlow::Break
                     });
                 }
                 EnrollmentUpdate::Error(e) => {
-                    instruction.set_label(&format!("Error: {}", e));
-                    let (s, eb, ab) = (stack.clone(), enroll_btn.clone(), add_more_btn.clone());
+                    instruction.set_label("Enrollment failed");
+                    sub_label.set_label(&e);
+                    let (s, er, ar) = (stack.clone(), enroll_row.clone(), add_row.clone());
                     glib::timeout_add_seconds_local(3, move || {
-                        eb.set_sensitive(true);
-                        ab.set_sensitive(true);
+                        er.set_sensitive(true);
+                        ar.set_sensitive(true);
                         s.set_visible_child_name("status");
                         glib::ControlFlow::Break
                     });
@@ -186,76 +356,94 @@ fn build_ui(app: &adw::Application) {
         });
         thread::spawn(move || {
             if let Err(e) = run_enrollment_process(tx, delete_first) {
-                eprintln!("Enrollment thread error: {}", e);
+                eprintln!("Enrollment thread error: {e}");
             }
         });
     }
 
-    // ── Re-enroll / first-enroll button ──────────────────────────────────────
-    enroll_btn.connect_clicked(move |btn| {
-        stack_clone.set_visible_child_name("enroll");
-        btn.set_sensitive(false);
-        add_more_for_enroll.set_sensitive(false);
-        let (tx, rx) = glib::MainContext::channel(glib::Priority::default());
-        let do_delete = btn.label().map(|l| l.starts_with("Re-enroll")).unwrap_or(false);
-        start_enrollment(tx, rx, do_delete,
-            picture_clone.clone(), instruction_clone.clone(), progress_clone.clone(),
-            stack_clone.clone(), enroll_btn_clone.clone(),
-            add_more_btn_clone.clone(), delete_btn_clone.clone());
-    });
+    // ── Enroll / Re-enroll row ────────────────────────────────────────────────
+    {
+        let stack2   = stack.clone();
+        let pic2     = picture.clone();
+        let instr2   = instruction_label.clone();
+        let sub2     = sub_label.clone();
+        let prog2    = progress_bar.clone();
+        let ctr2     = sample_counter.clone();
+        let er2      = enroll_row.clone();
+        let ar2      = add_more_row.clone();
+        let dr2      = delete_row.clone();
+        enroll_row.connect_activated(move |row| {
+            stack2.set_visible_child_name("enroll");
+            let do_delete = row.title().as_str().starts_with("Re-enroll");
+            row.set_sensitive(false);
+            ar2.set_sensitive(false);
+            let (tx, rx) = glib::MainContext::channel(glib::Priority::default());
+            start_enrollment(tx, rx, do_delete,
+                pic2.clone(), instr2.clone(), sub2.clone(),
+                prog2.clone(), ctr2.clone(), stack2.clone(),
+                er2.clone(), ar2.clone(), dr2.clone());
+        });
+    }
 
-    // ── Add More Angles (additive — never replaces existing embeddings) ───────
-    let stack_add       = stack.clone();
-    let picture_add     = picture.clone();
-    let instr_add       = instruction_label.clone();
-    let prog_add        = progress_bar.clone();
-    let enroll_add      = enroll_btn.clone();
-    let add_self        = add_more_btn.clone();
-    let add_peer        = add_more_btn.clone();
-    let delete_add      = delete_btn.clone();
-    add_more_btn.connect_clicked(move |btn| {
-        stack_add.set_visible_child_name("enroll");
-        btn.set_sensitive(false);
-        enroll_add.set_sensitive(false);
-        let (tx, rx) = glib::MainContext::channel(glib::Priority::default());
-        start_enrollment(tx, rx, false,   // false = keep existing data
-            picture_add.clone(), instr_add.clone(), prog_add.clone(),
-            stack_add.clone(), enroll_add.clone(),
-            add_peer.clone(), delete_add.clone());
-        let _ = add_self.clone();
-    });
+    // ── Add More Angles row ───────────────────────────────────────────────────
+    {
+        let stack3   = stack.clone();
+        let pic3     = picture.clone();
+        let instr3   = instruction_label.clone();
+        let sub3     = sub_label.clone();
+        let prog3    = progress_bar.clone();
+        let ctr3     = sample_counter.clone();
+        let er3      = enroll_row.clone();
+        let ar3      = add_more_row.clone();
+        let dr3      = delete_row.clone();
+        add_more_row.connect_activated(move |row| {
+            stack3.set_visible_child_name("enroll");
+            row.set_sensitive(false);
+            er3.set_sensitive(false);
+            let (tx, rx) = glib::MainContext::channel(glib::Priority::default());
+            start_enrollment(tx, rx, false,
+                pic3.clone(), instr3.clone(), sub3.clone(),
+                prog3.clone(), ctr3.clone(), stack3.clone(),
+                er3.clone(), ar3.clone(), dr3.clone());
+        });
+    }
 
-    // ── Delete Enrollment button ──────────────────────────────────────────────
-    delete_btn.connect_clicked(move |btn| {
-        let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(SOCKET_PATH) {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-            let req = AuthRequest::DeleteUser { user };
-            if send_request(&mut stream, req).is_ok() {
-                let _ = read_response(&mut stream);
+    // ── Delete row ────────────────────────────────────────────────────────────
+    {
+        let er4  = enroll_row.clone();
+        let ar4  = add_more_row.clone();
+        let dr4  = delete_row.clone();
+        delete_row.connect_activated(move |row| {
+            let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+            if let Ok(mut stream) = UnixStream::connect(SOCKET_PATH) {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                let req = AuthRequest::DeleteUser { user };
+                if send_request(&mut stream, req).is_ok() {
+                    let _ = read_response(&mut stream);
+                }
+                row.set_visible(false);
+                ar4.set_visible(false);
+                er4.set_title("Enroll My Face");
+                er4.set_subtitle("Capture 10 face samples across different angles");
             }
-            btn.set_visible(false);
-            add_more_for_del.set_visible(false);
-            enroll_btn_for_del.set_label("Enroll My Face");
-        }
-    });
+        });
+    }
 
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .title("FaceAuth")
-        .default_width(800)
-        .default_height(700)
-        .content(&content)
-        .build();
-
-    window.present();
+    // ── Cancel button (returns to home without finishing) ────────────────────
+    {
+        let stack4 = stack.clone();
+        cancel_btn.connect_clicked(move |_| {
+            stack4.set_visible_child_name("status");
+        });
+    }
 }
 
 
 enum EnrollmentUpdate {
     Frame(Texture),
-    Status(String, f32),
+    /// (main instruction text, subtitle hint, progress 0.0–1.0)
+    Status(String, String, f32),
     Success,
     Error(String),
 }
@@ -265,7 +453,11 @@ fn run_enrollment_process(tx: glib::Sender<EnrollmentUpdate>, delete_first: bool
 
     // If re-enrolling, delete existing data first
     if delete_first {
-        let _ = tx.send(EnrollmentUpdate::Status("Clearing previous enrollment data...".to_string(), 0.0));
+        let _ = tx.send(EnrollmentUpdate::Status(
+            "Clearing previous data…".to_string(),
+            "Starting fresh enrollment".to_string(),
+            0.0,
+        ));
         if let Ok(mut stream) = UnixStream::connect(SOCKET_PATH) {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -277,7 +469,7 @@ fn run_enrollment_process(tx: glib::Sender<EnrollmentUpdate>, delete_first: bool
         thread::sleep(std::time::Duration::from_millis(300));
     }
 
-    // Open camera at 1280×720 to match the auth pipeline (same resolution = consistent embeddings)
+    // Open camera at 1280×720 to match the auth pipeline
     let index = CameraIndex::Index(0);
     let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
         nokhwa::utils::CameraFormat::new_from(1280, 720, nokhwa::utils::FrameFormat::MJPEG, 30)
@@ -285,7 +477,7 @@ fn run_enrollment_process(tx: glib::Sender<EnrollmentUpdate>, delete_first: bool
     let mut camera = Camera::new(index, requested)?;
     camera.open_stream()?;
 
-    // Warmup: discard first few frames (auto-exposure settling)
+    // Warmup — discard first few frames (auto-exposure settling)
     for _ in 0..5 {
         let _ = camera.frame();
     }
@@ -295,37 +487,34 @@ fn run_enrollment_process(tx: glib::Sender<EnrollmentUpdate>, delete_first: bool
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     stream.set_write_timeout(Some(Duration::from_secs(60)))?;
 
-    // Enrollment target and pose guide
-    // We collect 10 unique face embeddings covering front + 4 angles (2 samples each).
-    // The daemon rejects duplicates (cosine > 0.95) so slightly different angles are needed.
-    const TARGET_SAMPLES: usize = 10;
-    let pose_guides = [
-        "Face straight at the camera",   // 1
-        "Hold still",                     // 2
-        "Turn head LEFT",                 // 3
-        "Hold — stay left",               // 4
-        "Turn head RIGHT",                // 5
-        "Hold — stay right",              // 6
-        "Chin UP",                        // 7
-        "Hold — chin up",                 // 8
-        "Chin DOWN",                      // 9
-        "Hold — almost done!",            // 10
+    // 10 unique embeddings covering 5 angles × 2 samples each.
+    const TARGET: usize = 10;
+    // (main instruction, subtitle hint)
+    let guides: [(&str, &str); TARGET] = [
+        ("Face straight at the camera",  "Look directly into the lens"),
+        ("Hold still",                   "Keep the same position"),
+        ("Turn head LEFT",               "Rotate slowly to your left"),
+        ("Hold — stay left",             "Keep the head turned left"),
+        ("Turn head RIGHT",              "Rotate slowly to your right"),
+        ("Hold — stay right",            "Keep the head turned right"),
+        ("Chin UP",                      "Tilt your chin upward slightly"),
+        ("Hold — chin up",               "Keep chin raised"),
+        ("Chin DOWN",                    "Lower your chin slightly"),
+        ("Hold — almost done!",          "Stay still for the last sample"),
     ];
 
     let mut collected = 0usize;
     let mut frame_num = 0usize;
     let mut face_detected = false;
 
-    let _ = tx.send(EnrollmentUpdate::Status(
-        format!("0/{TARGET_SAMPLES} - Look straight at the camera"),
-        0.0,
-    ));
+    let (g0, g1) = guides[0];
+    let _ = tx.send(EnrollmentUpdate::Status(g0.to_string(), g1.to_string(), 0.0));
 
     loop {
         let frame = camera.frame()?;
         let rgb_frame = frame.decode_image::<RgbFormat>()?;
 
-        // Send frame to daemon every ~500ms (every 15 frames at 30fps)
+        // Send frame to daemon every ~500 ms (every 15 frames at 30 fps)
         if frame_num % 15 == 0 {
             let req = AuthRequest::EnrollSample {
                 user: user.clone(),
@@ -340,73 +529,73 @@ fn run_enrollment_process(tx: glib::Sender<EnrollmentUpdate>, delete_first: bool
                         Ok(AuthResponse::Success) => {
                             collected += 1;
                             face_detected = true;
-                            let progress = collected as f32 / TARGET_SAMPLES as f32;
-                            if collected >= TARGET_SAMPLES {
+                            let progress = collected as f32 / TARGET as f32;
+                            if collected >= TARGET {
                                 let _ = tx.send(EnrollmentUpdate::Status(
-                                    format!("{collected}/{TARGET_SAMPLES} - all samples collected!"),
+                                    "All samples collected!".to_string(),
+                                    "Finishing up…".to_string(),
                                     1.0,
                                 ));
                             } else {
-                                let guide = pose_guides[collected.min(pose_guides.len() - 1)];
+                                let (gm, gs) = guides[collected.min(TARGET - 1)];
                                 let _ = tx.send(EnrollmentUpdate::Status(
-                                    format!("{collected}/{TARGET_SAMPLES} - {guide}"),
+                                    gm.to_string(),
+                                    gs.to_string(),
                                     progress,
                                 ));
                             }
-                        },
+                        }
                         Ok(AuthResponse::EnrollmentStatus { message: _, progress: dp }) => {
+                            let (gm, _) = guides[collected.min(TARGET - 1)];
                             if dp < 0.0 {
-                                // No face detected
                                 face_detected = false;
-                                let guide = pose_guides[collected.min(pose_guides.len() - 1)];
                                 let _ = tx.send(EnrollmentUpdate::Status(
-                                    format!("No face detected - step closer & look at camera [{guide}]"),
-                                    collected as f32 / TARGET_SAMPLES as f32,
+                                    "No face detected".to_string(),
+                                    format!("Step closer and {}", gm.to_lowercase()),
+                                    collected as f32 / TARGET as f32,
                                 ));
                             } else {
-                                // Duplicate pose
                                 face_detected = true;
-                                let guide = pose_guides[collected.min(pose_guides.len() - 1)];
                                 let _ = tx.send(EnrollmentUpdate::Status(
-                                    format!("Same pose - adjust your angle slightly [{guide}]"),
-                                    collected as f32 / TARGET_SAMPLES as f32,
+                                    "Same angle — move slightly".to_string(),
+                                    format!("Try: {}", gm.to_lowercase()),
+                                    collected as f32 / TARGET as f32,
                                 ));
                             }
-                        },
+                        }
                         Ok(AuthResponse::Failure) => {
                             let _ = tx.send(EnrollmentUpdate::Status(
-                                format!("Daemon error, retrying... ({collected}/{TARGET_SAMPLES})"),
-                                collected as f32 / TARGET_SAMPLES as f32,
+                                format!("Retrying… ({collected}/{TARGET})"),
+                                "Daemon busy, please wait".to_string(),
+                                collected as f32 / TARGET as f32,
                             ));
-                        },
+                        }
                         _ => {}
                     }
-                },
+                }
                 Err(e) => return Err(anyhow::anyhow!("Daemon connection lost: {}", e)),
             }
         }
 
-        // Mirror the display frame so the preview behaves like a selfie camera.
-        // The raw rgb_frame (unflipped) has already been sent to the daemon above,
-        // so enrollment and auth embeddings stay consistent.
+        // Mirror display frame (selfie view); raw unflipped frame was already sent above
         let mut display_frame = image::imageops::flip_horizontal(&rgb_frame);
         draw_guide_oval(&mut display_frame, face_detected);
 
-        // Scale down for display (1280×720 → 640×360) to keep UI lightweight
+        // Scale to 640×360 for display
         let display = image::imageops::resize(&display_frame, 640, 360, image::imageops::FilterType::Nearest);
-        let width = display.width() as i32;
+        let width  = display.width() as i32;
         let height = display.height() as i32;
-        let stride_bytes = width as usize * 3;
-        let bytes = glib::Bytes::from(&display.into_raw());
-        let texture = MemoryTexture::new(width, height, MemoryFormat::R8g8b8, &bytes, stride_bytes);
+        let stride = width as usize * 3;
+        let bytes   = glib::Bytes::from(&display.into_raw());
+        let texture = MemoryTexture::new(width, height, MemoryFormat::R8g8b8, &bytes, stride);
         let _ = tx.send(EnrollmentUpdate::Frame(texture.upcast()));
 
-        if collected >= TARGET_SAMPLES {
+        if collected >= TARGET {
             break;
         }
 
         frame_num += 1;
-        thread::sleep(std::time::Duration::from_millis(33)); // ~30fps
+        thread::sleep(std::time::Duration::from_millis(33)); // ~30 fps
     }
 
     let _ = tx.send(EnrollmentUpdate::Success);
