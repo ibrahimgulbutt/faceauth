@@ -514,6 +514,26 @@ async fn handle_client(
                     }
                 };
 
+                // Step 3a.5: Image quality / brightness guard.
+                // After a long sleep, V4L2 auto-exposure may not have converged.
+                // Log evidence: detection score dropped from 0.79 → 0.33 and recognition
+                // from 0.81 → 0.25 after a 65-min sleep.  The root cause is an under- or
+                // over-exposed frame.  If the mean brightness is outside [20, 235] the
+                // frame is unusable — abort early rather than running ONNX on garbage data.
+                {
+                    let pixels = frame0.as_raw();
+                    let mean_brightness: u64 = pixels.iter().map(|&p| p as u64).sum::<u64>() / pixels.len().max(1) as u64;
+                    if mean_brightness < 20 || mean_brightness > 235 {
+                        warn!("Frame brightness {} is outside acceptable range [20,235] — camera AEC not converged yet. Aborting.", mean_brightness);
+                        // Consume the full camera result so the spawned task can clean up.
+                        let _ = rx_full.await;
+                        rate_limiter.record_failure(&user);
+                        AuditLogger::log_auth_attempt(&user, false, 0.0, false);
+                        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                        return send_response(&mut stream, AuthResponse::Failure).await;
+                    }
+                }
+
                 // Step 3b: Start Detection on Frame 0 (Async/Parallel)
                 // Returns a tight face crop AND the bounding box so we can crop frames 1-N
                 // by propagating the bbox (face doesn't move significantly in ~200ms).
@@ -574,6 +594,12 @@ async fn handle_client(
                     warn!("No face detected in first frame. Aborting sequence.");
                     rate_limiter.record_failure(&user);
                     AuditLogger::log_auth_attempt(&user, false, 0.0, liveness_passed);
+                    // Back-pressure: give the camera sensor 800ms to stabilize before PAM
+                    // fires the next retry.  Without this, rapid retries re-open the camera
+                    // immediately after a cold-start failure, getting the same stale/dark
+                    // frames.  Evidence: at 14:03:35-45 three attempts ran in under 2 seconds
+                    // and all failed with stale-frame scores.
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
                     return send_response(&mut stream, AuthResponse::Failure).await;
                 }
 

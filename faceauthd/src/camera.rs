@@ -41,11 +41,14 @@ impl CameraManager {
             .context("Failed to create camera instance")?;
         cam.open_stream().context("Failed to open camera stream")?;
         // Give V4L2 time to flush stale frames from the internal buffer and
-        // let the auto-exposure/gain converge.  Without this, the first few
-        // decoded frames after a long idle (30+ minutes) are dark or blurry,
-        // which causes detection to fail and triggers an immediate PAM retry
-        // loop — amplifying CPU load.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // let the auto-exposure/gain converge.  After a long idle (30+ min)
+        // the sensor essentially cold-starts: the first 200–400ms of frames
+        // are under- or over-exposed.  Logs confirmed that even with 200ms,
+        // detection scores dropped from ~0.79 to ~0.33 and recognition scores
+        // from ~0.81 to ~0.25 after a 65-minute sleep.  At 500ms the AEC/AGC
+        // loop has had time for at least 1 full frame-rate feedback cycle
+        // (1/30s × ~15 iterations).
+        std::thread::sleep(std::time::Duration::from_millis(500));
         info!("Camera stream opened successfully.");
         Ok(ActiveCamera { camera: cam })
     }

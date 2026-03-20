@@ -310,7 +310,7 @@ strong_match_threshold = 0.65
 weak_match_threshold = 0.45
 
 [camera]
-warmup_frames = 5
+warmup_frames = 8
 sequence_length = 5
 sequence_interval_ms = 40
 
