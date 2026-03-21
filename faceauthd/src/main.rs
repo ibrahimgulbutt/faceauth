@@ -534,13 +534,15 @@ async fn handle_client(
                     }
                 }
 
-                // Step 3b: Start Detection on Frame 0 (Async/Parallel)
-                // Returns a tight face crop AND the bounding box so we can crop frames 1-N
-                // by propagating the bbox (face doesn't move significantly in ~200ms).
+                // Step 3b: Detect face in Frame 0 and produce a 112 × 112 landmark-aligned crop.
+                // The similarity transform is derived from ScrFD's 5-point keypoints, mapping
+                // detected eye/nose/mouth positions to the ArcFace canonical reference coords.
+                // This makes every embedding invariant to scale, in-plane rotation, and
+                // translation — the prerequisite for reliable cosine similarity matching.
                 let detector_clone = detector.clone();
                 let frame0_for_detect = frame0.clone();
                 let detection_task = tokio::task::spawn_blocking(move || {
-                    detector_clone.detect_with_bbox(&frame0_for_detect)
+                    detector_clone.detect_aligned(&frame0_for_detect)
                 });
 
                 // Step 3c: Wait for Camera Task to Finish (Remaining frames)
@@ -579,16 +581,15 @@ async fn handle_client(
 
                 let mut crops = Vec::new();
 
-                if let Ok(Ok(Some((face0, bbox0)))) = detection_result {
+                if let Ok(Ok(Some((face0, kpts)))) = detection_result {
                     crops.push(face0);
 
-                    // Step 3e: Crop frames 1-N using the propagated bbox from frame 0.
-                    // Equivalent to face tracking: the face doesn't move more than a few pixels
-                    // across the 200ms capture window, so the bbox is still accurate.
-                    // This gives tight face crops (vs. 720×720 center squares) for all frames,
-                    // dramatically improving ArcFace embedding quality.
+                    // Step 3e: Align frames 1-N using the keypoints from frame 0.
+                    // The face doesn't shift significantly across the ~200 ms capture window
+                    // so the same similarity transform gives consistent 112×112 aligned crops
+                    // for every frame. This is a pure geometric warp (~0.1 ms, no inference).
                     for i in 1..frames.len() {
-                        crops.push(detector.crop_from_bbox(&frames[i], &bbox0));
+                        crops.push(detector.align_from_kpts(&frames[i], &kpts));
                     }
                 } else {
                     warn!("No face detected in first frame. Aborting sequence.");
