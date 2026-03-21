@@ -237,9 +237,8 @@ async fn handle_client(
                             Ok(g) => g,
                             Err(poisoned) => { warn!("Camera mutex poisoned, recovering"); poisoned.into_inner() }
                         };
-                        let mut active_cam = cam_mgr.start_session()?;
-                        active_cam.warmup(config_clone.camera.warmup_frames)?;
-                        let frame0 = active_cam.capture_frame()?;
+                        let mut active_cam = cam_mgr.start_session(config_clone.camera.warmup_frames)?;
+                        let frame0 = active_cam.capture_frame()?;;
                         let _ = tx_frame0.send(frame0.clone());
                         let remaining = config_clone.camera.sequence_length - 1;
                         let rest = active_cam.capture_sequence(remaining, config_clone.camera.sequence_interval_ms)?;
@@ -458,14 +457,13 @@ async fn handle_client(
                             Err(poisoned) => { warn!("Camera mutex poisoned, recovering"); poisoned.into_inner() }
                         };
                         
-                        // Start Session
-                        // Solid Solution Fix: Retry logic for wake-from-sleep race condition
-                        let mut active_cam = match cam_mgr.start_session() {
+                        // Start Session — adaptive settle+warmup is handled inside start_session()
+                        let mut active_cam = match cam_mgr.start_session(config_clone.camera.warmup_frames) {
                             Ok(cam) => cam,
                             Err(e) => {
                                 warn!("Camera busy/unavailable, retrying after 500ms... ({})", e);
                                 std::thread::sleep(std::time::Duration::from_millis(500));
-                                match cam_mgr.start_session() {
+                                match cam_mgr.start_session(config_clone.camera.warmup_frames) {
                                     Ok(cam) => cam,
                                     Err(e2) => {
                                         error!("Camera init permanently failed: {}", e2);
@@ -476,8 +474,6 @@ async fn handle_client(
                                 }
                             }
                         };
-                        
-                        active_cam.warmup(config_clone.camera.warmup_frames)?;
                         
                         // Capture Frame 0
                         let frame0 = active_cam.capture_frame()?;
