@@ -461,8 +461,8 @@ async fn handle_client(
                         let mut active_cam = match cam_mgr.start_session(config_clone.camera.warmup_frames) {
                             Ok(cam) => cam,
                             Err(e) => {
-                                warn!("Camera busy/unavailable, retrying after 500ms... ({})", e);
-                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                warn!("Camera busy/unavailable, retrying after 300ms... ({})", e);
+                                std::thread::sleep(std::time::Duration::from_millis(300));
                                 match cam_mgr.start_session(config_clone.camera.warmup_frames) {
                                     Ok(cam) => cam,
                                     Err(e2) => {

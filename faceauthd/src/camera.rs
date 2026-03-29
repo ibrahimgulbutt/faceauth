@@ -53,7 +53,7 @@ impl CameraManager {
     /// |------------------|---------|---------------|----------------|
     /// | < 30 s (warm)    | 0 ms    | 2             | ~270 ms        |
     /// | 30 s – 5 min     | 100 ms  | 4             | ~500 ms        |
-    /// | > 5 min (cold)   | 500 ms  | configured    | ~1100 ms       |
+    /// | > 5 min (cold)   | 300 ms  | configured    | ~900 ms        |
     ///
     /// The `configured_warmup` value (from config.toml) is only used in the
     /// cold path; warm/tepid paths ignore it deliberately.
@@ -77,7 +77,7 @@ impl CameraManager {
             (100u64, 4usize)
         } else {
             // > 5 min or first open: full cold-start path.
-            (500u64, configured_warmup)
+            (300u64, configured_warmup)
         };
 
         info!("Opening camera stream (idle={}s → settle={}ms, warmup={}f)",
