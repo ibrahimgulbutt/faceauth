@@ -18,7 +18,8 @@ pub struct UserProfile {
     pub user: String,
     pub embeddings: Vec<Vec<f32>>,
     /// Recognizer model the embeddings came from. `None` for profiles written
-    /// before 1.0, which are assumed to match the installed model.
+    /// before 1.0: those came from the old INT8 MobileFaceNet file, which no
+    /// longer ships, so they never match and have to be set up again.
     #[serde(default)]
     pub model_id: Option<String>,
     #[serde(default)]
@@ -29,10 +30,7 @@ pub struct UserProfile {
 
 impl UserProfile {
     pub fn model_matches(&self, current: &str) -> bool {
-        match self.model_id.as_deref() {
-            None => true,
-            Some(id) => id == current,
-        }
+        self.model_id.as_deref() == Some(current)
     }
 }
 
@@ -212,6 +210,6 @@ mod tests {
         let legacy = r#"{"user":"bob","name":"bob","embeddings":[[1.0]],"last_updated":42}"#;
         let p: UserProfile = serde_json::from_str(legacy).unwrap();
         assert_eq!(p.updated, 42);
-        assert!(p.model_matches("anything"));
+        assert!(!p.model_matches("anything"), "pre-1.0 profiles must be set up again");
     }
 }

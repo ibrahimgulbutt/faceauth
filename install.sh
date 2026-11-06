@@ -383,21 +383,26 @@ fi
 
 # Record the chosen recognizer in [recognition] (adding the key or section if needed).
 set_recognition_model() {
-    local cfg="$CONFIG_DIR/config.toml" tmp
-    tmp=$(mktemp)
-    sudo cat "$cfg" | awk -v model="$1" '
-        /^[[:space:]]*\[/ {
-            if (in_rec && !done) { print "model = \"" model "\""; done = 1 }
-            in_rec = ($0 ~ /^[[:space:]]*\[recognition\][[:space:]]*$/)
-        }
-        in_rec && /^[[:space:]]*model[[:space:]]*=/ { if (!done) { print "model = \"" model "\""; done = 1 }; next }
+    # Replace an existing [recognition] model line in place (keeping its
+    # comments), else add one right under the [recognition] header, else add
+    # the section. Two passes over a copy: the first only looks for the line.
+    local cfg="$CONFIG_DIR/config.toml" orig tmp
+    orig=$(mktemp) tmp=$(mktemp)
+    sudo cat "$cfg" >"$orig"
+    awk -v line="model = \"$1\"" '
+        function is_header(l) { return l ~ /^[[:space:]]*\[/ }
+        function is_rec(l) { return l ~ /^[[:space:]]*\[recognition\][[:space:]]*(#.*)?$/ }
+        function is_model(l) { return l ~ /^[[:space:]]*model[[:space:]]*=/ }
+        NR == FNR { if (is_header($0)) in_rec = is_rec($0); else if (in_rec && is_model($0)) has = 1; next }
+        FNR == 1 { in_rec = 0 }
+        is_header($0) { in_rec = is_rec($0) }
+        in_rec && is_model($0) { if (!done) { print line; done = 1 }; next }
         { print }
-        END {
-            if (in_rec && !done) { print "model = \"" model "\""; done = 1 }
-            if (!done) { print ""; print "[recognition]"; print "model = \"" model "\"" }
-        }' >"$tmp"
+        in_rec && is_rec($0) && !has && !done { print line; done = 1 }
+        END { if (!done) { print ""; print "[recognition]"; print line } }
+    ' "$orig" "$orig" >"$tmp"
     sudo install -m 644 "$tmp" "$cfg"
-    rm -f "$tmp"
+    rm -f "$orig" "$tmp"
 }
 set_recognition_model "$MODEL_CHOICE"
 ok "Recognizer set to '$MODEL_CHOICE' (changing it later means setting up face unlock again)"

@@ -139,8 +139,9 @@ Path: `/var/lib/faceauth/<user>/models.enc`, owned by `faceauth`, mode 0600.
 
 - **Model ID.** `model_id` is the first 16 hex characters of the SHA-256 of the
   recognition model file. A profile whose ID differs from the installed model is
-  reported as `ModelChanged`. Profiles from before 1.0 have no ID and are
-  adopted by the current model.
+  reported as `ModelChanged`. Profiles from before 1.0 have no ID; they were
+  made with the old INT8 MobileFaceNet file, which is no longer installed, so
+  they are reported as `ModelChanged` too.
 - **What the encryption protects.** GCM authenticates the ciphertext, so a
   modified file fails to decrypt instead of loading altered data. The key lives
   on the same disk, so this protects a copied profile file. It does not protect

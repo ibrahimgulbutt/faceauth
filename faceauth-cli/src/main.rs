@@ -145,13 +145,16 @@ fn ping() -> Result<(String, u32)> {
 fn status() -> Result<ExitCode> {
     let s = fetch_status()?;
     let used = pam::configured_services();
-    if s.enrolled {
+    if s.enrolled && s.model_current {
         println!("{} Face unlock is set up for {}", Style::Ok.paint("●"), Style::Bold.paint(&s.user));
         println!("  Samples   {} of {}", s.samples, s.max_samples);
-        println!("  Set up    {}", term::date(s.created));
-        if !s.model_current {
-            println!("  {} The face model changed after an update. Run: faceauth enroll", Style::Warn.paint("!"));
+        if s.created != 0 {
+            println!("  Set up    {}", term::date(s.created));
         }
+    } else if s.enrolled {
+        println!("{} Face unlock is paused for {}", Style::Warn.paint("!"), Style::Bold.paint(&s.user));
+        println!("  Your face was set up with a different face model. Set it up again:");
+        println!("  Run: faceauth enroll");
     } else {
         println!("{} Face unlock is not set up for {}", Style::Dim.paint("○"), Style::Bold.paint(&s.user));
         println!("  Run: faceauth enroll");

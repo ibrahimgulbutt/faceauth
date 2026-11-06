@@ -104,6 +104,7 @@ privilege-escalation bugs; upgrade, and set up face unlock again afterwards.
 ### Changed
 - **Models come from InsightFace directly** and are the original files, not this project's INT8 conversions (which were only ~25% faster, with unknown accuracy loss). Nothing is rehosted, so no model files need to be published with a FaceAuth release. Old INT8 files are removed on upgrade.
 - Frame 0 is detected and recognised while the camera is still capturing the rest of the sequence.
+- **Face data from before 1.0 is paused, not compared.** It was made with the old INT8 model, so face unlock reports that it needs setting up again (in sudo, `faceauth status` and the app) instead of failing the match and counting toward lockout.
 
 - **Better detection.**
   - Frames are letterboxed to 640×640 instead of being squashed, which improves
