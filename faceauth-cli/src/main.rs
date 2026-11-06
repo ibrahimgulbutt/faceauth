@@ -1,207 +1,392 @@
+//! `faceauth` — command-line front end for faceauthd.
+
+mod polkit_agent;
+mod term;
+
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use faceauth_core::{AuthRequest, AuthResponse, SOCKET_PATH};
+use faceauth_core::{
+    pam,
+    client_socket_path, recv_message, send_message, AuthOutcome, EnrollEvent, EnrollMode, Hint, Request, Response,
+    UserStatus, PROTOCOL_VERSION, VERSION,
+};
+use std::io::{IsTerminal, Write};
 use std::os::unix::net::UnixStream;
-use std::io::{Read, Write};
-use anyhow::{Context, Result};
+use std::process::ExitCode;
 use std::time::Duration;
+use term::Style;
 
 #[derive(Parser)]
-#[command(name = "faceauth")]
-#[command(version)]
-#[command(about = "FaceAuth — face authentication for Linux", long_about = "\
-FaceAuth lets you log in to sudo, GDM, SDDM and LightDM with your face.
+#[command(name = "faceauth", version, about = "Face unlock for Linux", long_about = "\
+Face unlock for sudo, the login screen, the lock screen and admin prompts.
 
-QUICK START
-  1. Enroll your face (GUI):      faceauth-gui
-  2. Test authentication:         faceauth test --user $USER
-  3. Check system health:         faceauth doctor
+GETTING STARTED
+  faceauth enroll        Set up face unlock (asks for your password)
+  faceauth test          Check that the camera recognizes you
+  faceauth doctor        Diagnose problems
 
-The daemon (faceauthd) must be running. Check with:  faceauth ping
-Service logs:  sudo journalctl -u faceauth.service -f")]
+The graphical app is called Face Unlock (faceauth-gui).")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
-enum Commands {
-    /// Check daemon connectivity (returns 'pong' if running)
-    Ping,
-    /// List all enrolled users and their face-sample counts
-    List,
-    /// Test face authentication for a user (opens the camera)
-    Test {
-        /// Username to authenticate (defaults to $USER if omitted)
-        #[arg(short, long, default_value_t = std::env::var("USER").unwrap_or_default())]
-        user: String,
+enum Command {
+    /// Show whether face unlock is set up for you (default)
+    Status,
+    /// Set up face unlock, or add samples with --add
+    Enroll {
+        /// Add samples to your existing setup instead of replacing it
+        #[arg(long)]
+        add: bool,
+        /// Account to set up (root only)
+        #[arg(long)]
+        user: Option<String>,
     },
-    /// Run system diagnostics (daemon, camera, PAM, models, config)
+    /// Check that the camera recognizes you
+    Test {
+        /// Account to test (root only; defaults to you)
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Delete your face data
+    Remove {
+        /// Account whose data to delete (root only)
+        #[arg(long)]
+        user: Option<String>,
+        /// Don't ask for confirmation
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// List enrolled accounts (root sees everyone)
+    List,
+    /// List cameras and show which one is used
+    Cameras,
+    /// Check the daemon, camera, models, PAM and polkit setup
     Doctor,
-    /// Measure detection and recognition pipeline latency
+    /// Measure how long each stage of recognition takes
     Benchmark,
+    /// Print client and daemon versions
+    Version,
+    /// Exit 0 if the daemon answers (for scripts)
+    Ping,
 }
 
-fn set_timeout(stream: &mut UnixStream, sec: u64) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(sec)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(sec)))?;
-    Ok(())
-}
-
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-
-    match cli.command {
-        Commands::Benchmark => {
-            println!("Running FaceAuth Benchmark...");
-            let mut stream = UnixStream::connect(SOCKET_PATH)
-                .context("Failed to connect to daemon. Is it running?")?;
-            set_timeout(&mut stream, 60)?;
-
-            send_request(&mut stream, &AuthRequest::Benchmark)?;
-            let response = read_response(&mut stream)?;
-
-            match response {
-                AuthResponse::BenchmarkResult { detection_ms, recognition_ms, capture_ms, total_ms } => {
-                    println!("Benchmark Results:");
-                    println!("  Capture Time:     {:.2} ms (Warmup + Sequence)", capture_ms);
-                    println!("  Detection Time:   {:.2} ms", detection_ms);
-                    println!("  Recognition Time: {:.2} ms", recognition_ms);
-                    println!("  Total Pipeline:   {:.2} ms", total_ms);
-                },
-                _ => println!("Unexpected response: {:?}", response),
-            }
-        },
-        Commands::Doctor => {
-            println!("Running FaceAuth Doctor...");
-            
-            // 1. Check Daemon Connection
-            print!("Checking Daemon connection... ");
-            match UnixStream::connect(SOCKET_PATH) {
-                Ok(mut stream) => {
-                    if set_timeout(&mut stream, 2).is_ok() 
-                       && send_request(&mut stream, &AuthRequest::Ping).is_ok() {
-                        if let Ok(AuthResponse::Pong) = read_response(&mut stream) {
-                            println!("[OK] (Pong received)");
-                        } else {
-                            println!("[WARNING] Connected but no PONG received (Timeout?)");
-                        }
-                    } else {
-                         println!("[OK] (Connected)");
-                    }
-                },
-                Err(_) => println!("[ERROR] Could not connect to {}. Is the service running?", SOCKET_PATH),
-            }
-
-            // 2. Check Camera
-            print!("Checking Camera device... ");
-            if std::path::Path::new("/dev/video0").exists() {
-                println!("[OK] /dev/video0 found");
-            } else {
-                println!("[WARNING] /dev/video0 not found. (Libcamera might still work)");
-            }
-
-            // 3. Check PAM Config
-            print!("Checking PAM configuration... ");
-            let pam_path = std::path::Path::new("/etc/pam.d/sudo");
-            if pam_path.exists() {
-                let content = std::fs::read_to_string(pam_path).unwrap_or_default();
-                if content.contains("pam_faceauth.so") {
-                    println!("[OK] pam_faceauth.so found in sudo config");
-                } else {
-                    println!("[WARNING] pam_faceauth.so NOT found in /etc/pam.d/sudo");
-                }
-            } else {
-                println!("[SKIP] /etc/pam.d/sudo not found");
-            }
-
-            // 4. Check Models
-            print!("Checking Models... ");
-            if std::path::Path::new("/usr/share/faceauth/models/arcface.onnx").exists() {
-                println!("[OK] ArcFace model found");
-            } else {
-                println!("[ERROR] Models missing in /usr/share/faceauth/models/");
-            }
-
-            // 5. Check Config
-            print!("Checking Configuration... ");
-            if std::path::Path::new("/etc/faceauth/config.toml").exists() {
-                println!("[OK] Config file found");
-            } else {
-                println!("[WARN] Config file missing, using defaults");
-            }
+    let result = match cli.command.unwrap_or(Command::Status) {
+        Command::Status => status(),
+        Command::Enroll { add, user } => enroll(if add { EnrollMode::Append } else { EnrollMode::Replace }, user),
+        Command::Test { user } => test(user),
+        Command::Remove { user, yes } => remove(user, yes),
+        Command::List => list(),
+        Command::Cameras => cameras(),
+        Command::Doctor => doctor(),
+        Command::Benchmark => benchmark(),
+        Command::Version => version(),
+        Command::Ping => return if ping().is_ok() { ExitCode::SUCCESS } else { ExitCode::FAILURE },
+    };
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("{} {e:#}", Style::Error.paint("error:"));
+            ExitCode::FAILURE
         }
-        Commands::Ping => {
-            let mut stream = UnixStream::connect(SOCKET_PATH)
-                .context("Failed to connect to daemon. Is it running?")?;
-            set_timeout(&mut stream, 5)?;
-            
-            send_request(&mut stream, &AuthRequest::Ping)?;
-            let response = read_response(&mut stream)?;
+    }
+}
 
-            match response {
-                AuthResponse::Pong => println!("pong"),
-                _ => println!("Unexpected response: {:?}", response),
-            }
+// ─── Connection ─────────────────────────────────────────────────────────────
+
+fn connect(timeout: Duration) -> Result<UnixStream> {
+    let path = client_socket_path();
+    let stream = UnixStream::connect(&path).with_context(|| {
+        format!(
+            "cannot reach the FaceAuth service at {}. Is it running? Try: sudo systemctl start faceauth",
+            path.display()
+        )
+    })?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    Ok(stream)
+}
+
+fn request(req: &Request, timeout: Duration) -> Result<Response> {
+    let mut stream = connect(timeout)?;
+    send_message(&mut stream, req)?;
+    Ok(recv_message(&mut stream)?)
+}
+
+fn unexpected(r: Response) -> anyhow::Error {
+    match r {
+        Response::Denied { reason } => anyhow::anyhow!("not allowed: {reason}"),
+        Response::Error { message } => anyhow::anyhow!("{message}"),
+        Response::Enroll(EnrollEvent::Failed(f)) => anyhow::anyhow!("{}", f.message()),
+        other => anyhow::anyhow!("unexpected reply from the service: {other:?}"),
+    }
+}
+
+fn fetch_status() -> Result<UserStatus> {
+    match request(&Request::Status, Duration::from_secs(5))? {
+        Response::Status(s) => Ok(s),
+        other => Err(unexpected(other)),
+    }
+}
+
+fn ping() -> Result<(String, u32)> {
+    match request(&Request::Ping, Duration::from_secs(3))? {
+        Response::Pong { version, protocol } => Ok((version, protocol)),
+        other => Err(unexpected(other)),
+    }
+}
+
+// ─── Commands ───────────────────────────────────────────────────────────────
+
+fn status() -> Result<ExitCode> {
+    let s = fetch_status()?;
+    let used = pam::configured_services();
+    if s.enrolled {
+        println!("{} Face unlock is set up for {}", Style::Ok.paint("●"), Style::Bold.paint(&s.user));
+        println!("  Samples   {} of {}", s.samples, s.max_samples);
+        println!("  Set up    {}", term::date(s.created));
+        if !s.model_current {
+            println!("  {} The face model changed after an update. Run: faceauth enroll", Style::Warn.paint("!"));
         }
-        Commands::Test { user } => {
-            println!("Testing face authentication for user: {}", user);
-            println!("Look at your camera when it activates…");
-            let mut stream = UnixStream::connect(SOCKET_PATH)
-                .context("Cannot connect to daemon — is faceauthd running? Try: sudo systemctl start faceauth.service")?;
-            set_timeout(&mut stream, 20)?;
+    } else {
+        println!("{} Face unlock is not set up for {}", Style::Dim.paint("○"), Style::Bold.paint(&s.user));
+        println!("  Run: faceauth enroll");
+    }
+    println!("  Camera    {}", s.camera.as_deref().unwrap_or("none found"));
+    println!("  Model     {}", s.recognizer);
+    println!("  Used for  {}", if used.is_empty() { "nothing yet (re-run the installer to choose)".into() } else { pam::labels(&used) });
+    Ok(ExitCode::SUCCESS)
+}
 
-            send_request(&mut stream, &AuthRequest::Authenticate { user: user.clone() })?;
-            let response = read_response(&mut stream)?;
+fn enroll(mode: EnrollMode, user: Option<String>) -> Result<ExitCode> {
+    let who = user.clone().unwrap_or_else(|| fetch_status().map(|s| s.user).unwrap_or_else(|_| "you".into()));
+    let title = match mode {
+        EnrollMode::Replace => "Setting up face unlock",
+        EnrollMode::Append => "Improving face unlock",
+    };
+    println!("{} for {}", Style::Bold.paint(title), Style::Bold.paint(&who));
 
-            match response {
-                AuthResponse::Success => println!("✓  Authentication SUCCESS for '{}'", user),
-                AuthResponse::Failure => println!("✗  Authentication FAILED for '{}'\n   Tip: re-enroll with more angles using faceauth-gui", user),
-                _ => println!("Unexpected response: {:?}", response),
+    // A terminal password prompt, used only if no graphical agent is running.
+    let _agent = polkit_agent::TtyAgent::spawn();
+
+    let mut stream = connect(Duration::from_secs(150))?;
+    send_message(&mut stream, &Request::Enroll { mode, user })?;
+    let mut view = term::Progress::new();
+    loop {
+        let event = match recv_message::<_, Response>(&mut stream) {
+            Ok(Response::Enroll(e)) => e,
+            Ok(other) => return Err(unexpected(other)),
+            Err(e) => bail!("lost connection to the service: {e}"),
+        };
+        match event {
+            EnrollEvent::Authorizing => println!("Confirm with your password to continue…"),
+            EnrollEvent::Started { steps } => {
+                println!("Camera is on. Follow the prompts; press Ctrl+C to cancel.\n");
+                view.start(steps.len());
             }
-        }
-        Commands::List => {
-            let mut stream = UnixStream::connect(SOCKET_PATH)
-                .context("Failed to connect to daemon. Is it running?")?;
-            set_timeout(&mut stream, 5)?;
-            
-            send_request(&mut stream, &AuthRequest::ListEnrolled)?;
-            let response = read_response(&mut stream)?;
-
-            match response {
-                AuthResponse::EnrolledList(users) => {
-                    if users.is_empty() {
-                        println!("No users enrolled.");
-                    } else {
-                        println!("{:<20} | {:<10}", "User", "Faces");
-                        println!("{:-<20}-|-{:-<10}", "", "");
-                        for (user, count) in users {
-                            println!("{:<20} | {:<10}", user, count);
-                        }
-                    }
-                },
-                _ => println!("Unexpected response: {:?}", response),
+            EnrollEvent::Frame { .. } => {}
+            EnrollEvent::Progress { collected, target, pose, hint } => {
+                let detail = if hint == Hint::Good { "" } else { hint.message() };
+                view.update(collected, target, pose.instruction(), detail, hint.is_problem());
+            }
+            EnrollEvent::Completed { samples } => {
+                view.finish();
+                println!("{} Done. Face unlock is ready ({samples} samples).", Style::Ok.paint("✓"));
+                println!("  Try it: faceauth test   or   sudo true");
+                return Ok(ExitCode::SUCCESS);
+            }
+            EnrollEvent::Failed(f) => {
+                view.finish();
+                bail!("{}", f.message());
             }
         }
     }
-
-    Ok(())
 }
 
-fn send_request(stream: &mut UnixStream, req: &AuthRequest) -> Result<()> {
-    let data = serde_json::to_vec(req)?;
-    let len = data.len() as u32;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(&data)?;
-    Ok(())
+fn test(user: Option<String>) -> Result<ExitCode> {
+    let user = match user {
+        Some(u) => u,
+        None => fetch_status()?.user,
+    };
+    let mut stream = connect(Duration::from_secs(20))?;
+    send_message(&mut stream, &Request::Authenticate { user: user.clone() })?;
+    let mut scanning = false;
+    loop {
+        match recv_message::<_, Response>(&mut stream)? {
+            Response::Scanning => {
+                print!("Look at the camera… ");
+                std::io::stdout().flush()?;
+                scanning = true;
+            }
+            Response::Auth(outcome) => {
+                let ok = outcome == AuthOutcome::Matched;
+                let mark = if ok { Style::Ok.paint("✓") } else { Style::Error.paint("✗") };
+                if scanning {
+                    println!();
+                }
+                println!("{mark} {}", outcome.message());
+                if outcome == AuthOutcome::NotMatched {
+                    println!("  Tip: add samples in this lighting with: faceauth enroll --add");
+                }
+                return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+            }
+            other => return Err(unexpected(other)),
+        }
+    }
 }
 
-fn read_response(stream: &mut UnixStream) -> Result<AuthResponse> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf)?;
-    let resp: AuthResponse = serde_json::from_slice(&buf)?;
-    Ok(resp)
+fn remove(user: Option<String>, yes: bool) -> Result<ExitCode> {
+    let who = user.clone().unwrap_or_else(|| "your".into());
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            bail!("refusing to delete without confirmation; pass --yes");
+        }
+        let target = if user.is_some() { format!("{who}'s") } else { who.clone() };
+        print!("Delete {target} face data? Face unlock will stop working. [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("Nothing deleted.");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    let _agent = polkit_agent::TtyAgent::spawn();
+    match request(&Request::Remove { user }, Duration::from_secs(150))? {
+        Response::Removed => {
+            println!("{} Face data deleted.", Style::Ok.paint("✓"));
+            Ok(ExitCode::SUCCESS)
+        }
+        other => Err(unexpected(other)),
+    }
 }
 
+fn list() -> Result<ExitCode> {
+    match request(&Request::ListEnrolled, Duration::from_secs(5))? {
+        Response::Users(users) if users.is_empty() => println!("No one has set up face unlock."),
+        Response::Users(users) => {
+            println!("{:<24} {:>7}  UPDATED", "USER", "SAMPLES");
+            for u in users {
+                let note = if u.model_current { "" } else { "needs setup again (model changed)" };
+                println!("{:<24} {:>7}  {:<12} {note}", u.user, u.samples, term::date(u.updated));
+            }
+        }
+        other => return Err(unexpected(other)),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cameras() -> Result<ExitCode> {
+    match request(&Request::Cameras, Duration::from_secs(10))? {
+        Response::Cameras(list) if list.is_empty() => println!("No cameras found."),
+        Response::Cameras(list) => {
+            for c in &list {
+                let mark = if c.selected { Style::Ok.paint("●") } else { " ".into() };
+                let ir = if c.infrared { Style::Warn.paint(" [IR]") } else { String::new() };
+                println!("{mark} {:<12} {}{ir}", c.path, c.name);
+                println!("  {:<12} {}", "", Style::Dim.paint(&c.formats.join(", ")));
+            }
+            println!("\n● = in use. To choose another, set camera.device in /etc/faceauth/config.toml");
+            println!("  (e.g. device = \"/dev/video2\") and run: sudo systemctl restart faceauth");
+            if list.iter().any(|c| c.infrared) {
+                println!("  IR cameras often need their emitter enabled: https://github.com/EmixamPP/linux-enable-ir-emitter");
+            }
+        }
+        other => return Err(unexpected(other)),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn benchmark() -> Result<ExitCode> {
+    println!("Look at the camera…");
+    match request(&Request::Benchmark, Duration::from_secs(60))? {
+        Response::Benchmark(b) => {
+            println!("Camera       {} ({})", b.camera, b.resolution);
+            println!("Recognizer   {}", b.recognizer);
+            println!("Capture      {:>7.0} ms  (open, warm-up, frame sequence)", b.capture_ms);
+            println!("Detection    {:>7.0} ms  (overlaps capture)", b.detection_ms);
+            println!("Recognition  {:>7.0} ms  (all frames; frame 1 overlaps capture, logins stop once the vote is decided)", b.recognition_ms);
+            println!("Total        {:>7.0} ms", b.total_ms);
+            Ok(ExitCode::SUCCESS)
+        }
+        other => Err(unexpected(other)),
+    }
+}
+
+fn version() -> Result<ExitCode> {
+    println!("faceauth   {VERSION} (protocol {PROTOCOL_VERSION})");
+    match ping() {
+        Ok((v, p)) => println!("faceauthd  {v} (protocol {p})"),
+        Err(_) => println!("faceauthd  not running"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn doctor() -> Result<ExitCode> {
+    let mut problems = 0;
+    let mut check = |ok: Option<bool>, label: &str, detail: String| {
+        let mark = match ok {
+            Some(true) => Style::Ok.paint("✓"),
+            Some(false) => {
+                problems += 1;
+                Style::Error.paint("✗")
+            }
+            None => Style::Warn.paint("!"),
+        };
+        println!("{mark} {label:<16} {detail}");
+    };
+
+    match ping() {
+        Ok((v, p)) if p == PROTOCOL_VERSION => check(Some(true), "Service", format!("faceauthd {v} is running")),
+        Ok((v, p)) => check(Some(false), "Service", format!("faceauthd {v} speaks protocol {p}, this tool {PROTOCOL_VERSION}; reinstall")),
+        Err(_) => check(Some(false), "Service", "not running — sudo systemctl start faceauth; logs: journalctl -u faceauth".into()),
+    }
+    match fetch_status() {
+        Ok(s) if s.enrolled && s.model_current => check(Some(true), "Your face", format!("set up ({} samples)", s.samples)),
+        Ok(s) if s.enrolled => check(Some(false), "Your face", "face model changed — run: faceauth enroll".into()),
+        Ok(_) => check(None, "Your face", "not set up — run: faceauth enroll".into()),
+        Err(_) => check(None, "Your face", "unknown (service not reachable)".into()),
+    }
+    match request(&Request::Cameras, Duration::from_secs(10)) {
+        Ok(Response::Cameras(list)) => match list.iter().find(|c| c.selected) {
+            Some(c) => check(Some(true), "Camera", format!("{} ({})", c.name, c.path)),
+            None if list.is_empty() => check(Some(false), "Camera", "no camera found".into()),
+            None => check(Some(false), "Camera", "configured camera not found — see: faceauth cameras".into()),
+        },
+        _ => check(None, "Camera", "unknown (service not reachable)".into()),
+    }
+    let models = std::path::Path::new("/usr/share/faceauth/models");
+    let has = |stem: &str| [".onnx", "_int8.onnx"].iter().any(|ext| std::fs::metadata(models.join(format!("{stem}{ext}"))).map(|m| m.len() > 0).unwrap_or(false));
+    match fetch_status() {
+        Ok(s) => check(Some(true), "Models", format!("{} in {}", s.recognizer, models.display())),
+        Err(_) if has("det_500m") && (has("arcface") || has("arcface_r50")) => check(None, "Models", format!("found in {} (service not reachable)", models.display())),
+        Err(_) => check(Some(false), "Models", format!("missing in {} — re-run the installer", models.display())),
+    }
+    let services = pam::configured_services();
+    if services.is_empty() {
+        check(None, "Used for", "nothing yet — re-run the installer and choose where to use face unlock".into());
+    } else {
+        check(Some(true), "Used for", pam::labels(&services));
+    }
+    match pam::module_path() {
+        Some(p) => check(Some(true), "PAM module", p.display().to_string()),
+        None => check(Some(false), "PAM module", "pam_faceauth.so not found next to pam_unix.so".into()),
+    }
+    let policy = std::path::Path::new("/usr/share/polkit-1/actions/org.faceauth.manage.policy");
+    check(Some(policy.exists()), "Polkit policy", if policy.exists() { "installed".into() } else { format!("{} missing — setup cannot ask for your password", policy.display()) });
+    let config = std::path::Path::new("/etc/faceauth/config.toml");
+    check(if config.exists() { Some(true) } else { None }, "Config", if config.exists() { config.display().to_string() } else { "not found, using defaults".into() });
+
+    println!();
+    if problems == 0 {
+        println!("No problems found.");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        println!("{problems} problem(s) found.");
+        Ok(ExitCode::FAILURE)
+    }
+}

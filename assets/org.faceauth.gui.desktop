@@ -1,11 +1,10 @@
 [Desktop Entry]
-Name=FaceAuth
-GenericName=Face Enrollment
-Comment=Manage face login enrollment for FaceAuth
+Name=Face Unlock
+GenericName=Face Authentication
+Comment=Set up face unlock for sudo and your login screen
 Exec=faceauth-gui
 Icon=org.faceauth.gui
 Type=Application
-Categories=System;Security;Settings;
-Keywords=face;login;biometric;authentication;enroll;camera;
-StartupWMClass=faceauth-gui
+Categories=Settings;Security;GTK;
+Keywords=face;unlock;login;camera;biometric;security;faceauth;
 StartupNotify=true

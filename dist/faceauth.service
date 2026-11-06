@@ -1,0 +1,85 @@
+[Unit]
+Description=FaceAuth face authentication daemon
+Documentation=https://github.com/ibrahimgulbutt/faceauth
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/faceauthd
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=2
+
+# Unprivileged system user. PAM trusts a daemon running as root or as this
+# user only. The video group grants camera access.
+User=faceauth
+Group=faceauth
+SupplementaryGroups=video
+
+# /run/faceauth holds the socket. It is owned by the daemon user, so no other
+# user can create or swap the socket. /var/lib/faceauth holds master.key and
+# the encrypted face profiles.
+RuntimeDirectory=faceauth
+RuntimeDirectoryMode=0755
+StateDirectory=faceauth
+StateDirectoryMode=0700
+UMask=0077
+
+# Core dumps could contain decrypted face data.
+LimitCORE=0
+
+# ── Performance ──────────────────────────────────────────────────────────────
+# Prevent swapping — ensures fast wake-up after sleep
+MemorySwapMax=0
+# Run below normal scheduling priority so ONNX inference doesn't
+# starve the compositor/desktop on resume from sleep.
+Nice=10
+CPUSchedulingPolicy=batch
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+# Reduce memory fragmentation
+Environment=MALLOC_ARENA_MAX=2
+# Cap ALL ONNX / OpenMP / MKL thread pools to 1.
+# Without this, int8 ONNX models still spawn a thread per CPU core
+# via OMP/MKL *even when* intra_threads=1 is set in the session,
+# causing the CPU spike on every login and especially after sleep.
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=ORT_DISABLE_SPINNING=1
+
+# ── Sandbox ──────────────────────────────────────────────────────────────────
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# No network namespace access. The D-Bus system bus (used by pkcheck for
+# polkit) and NSS lookups (sssd, systemd-userdb, nslcd) all go through
+# path-based unix sockets on the filesystem, which work across network
+# namespaces, so they keep working.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+# Only video devices.
+DevicePolicy=closed
+DeviceAllow=char-video4linux rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# ProtectProc= and ProcSubset= are deliberately not set: the daemon reads
+# /proc/<pid>/stat of connecting clients to identify them to polkit.
+
+[Install]
+WantedBy=multi-user.target

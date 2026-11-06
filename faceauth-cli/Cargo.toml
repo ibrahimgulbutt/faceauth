@@ -1,13 +1,16 @@
 [package]
 name = "faceauth-cli"
-version = "0.1.0"
-edition = "2021"
+description = "Command-line tool for FaceAuth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 faceauth-core = { path = "../faceauth-core" }
 clap = { version = "4.0", features = ["derive"] }
-serde_json = "1.0"
 anyhow = "1.0"
+libc = "0.2"
 
 [[bin]]
 name = "faceauth"

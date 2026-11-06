@@ -1,132 +1,161 @@
-use anyhow::Result;
-use image::{ImageBuffer, Rgb};
-use ndarray::{Array, Array4};
-use ort::session::{Session, builder::GraphOptimizationLevel};
+//! ArcFace face embeddings.
+
+use anyhow::{Context, Result};
+use image::RgbImage;
+use log::info;
+use ndarray::Array4;
+use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Value;
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
 use std::sync::Mutex;
-use log::{info, error, warn};
 
+pub use crate::config::RecognitionModel;
 
-// Constants for ArcFace (MobileFaceNet)
-const INPUT_SIZE: (u32, u32) = (112, 112);
+const INPUT: u32 = 112;
 
 pub struct FaceEngine {
-    // detection_session: Session, // TODO: Add RetinaFace/SCRFD
-    recognition_session: Option<Mutex<Session>>,
+    session: Mutex<Session>,
+    /// First 16 hex digits of the model file's SHA-256. Stored with every
+    /// profile: embeddings from different models are not comparable.
+    pub model_id: String,
 }
 
 impl FaceEngine {
-    pub fn new() -> Result<Self> {
-        // In a real scenario, we would load models from /usr/share/faceauth/models/
-        // For this phase, we will try to load them if they exist, or fail gracefully.
-        
-        let model_path = Path::new("/usr/share/faceauth/models/arcface.onnx");
-        
-        // Check for quantized model
-        let quantized_path = Path::new("/usr/share/faceauth/models/arcface_int8.onnx");
-        
-        // Solid Solution Fix: Check size > 0
-        let is_valid_quantized = if quantized_path.exists() {
-            if let Ok(metadata) = std::fs::metadata(&quantized_path) {
-                metadata.len() > 0
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        let final_path = if is_valid_quantized {
-            info!("Found valid quantized recognition model: {:?}", quantized_path);
-            quantized_path
-        } else {
-            if quantized_path.exists() {
-                warn!("Found quantized model {:?} but it is empty/invalid. Falling back to standard model.", quantized_path);
-            }
-            model_path
-        };
-
-        // Threading Optimization:
-        // Use single-threaded inference per session to allow maximum parallel throughput of frames
-        let intra_threads = 1;
-
-        let recognition_session = if final_path.exists() {
-            info!("Loading ArcFace model from {:?} with {} thread (Parallel-Optimized)", final_path, intra_threads);
-            match Session::builder() {
-                Ok(builder) => {
-                    match builder
-                        .with_optimization_level(GraphOptimizationLevel::Level1)
-                        .and_then(|b| b.with_intra_threads(intra_threads))   // parallel within node
-                        .and_then(|b| b.with_inter_threads(intra_threads))   // parallel between nodes
-                        .and_then(|b| b.with_parallel_execution(false))
-                        .and_then(|b| b.commit_from_file(final_path)) 
-                    {
-                        Ok(s) => Some(Mutex::new(s)),
-                        Err(e) => {
-                            error!("CRITICAL: Failed to load Recognition Model from {:?}: {}", final_path, e);
-                            error!("Possible causes: Corrupted file, Missing permissions, or Incompatible CPU instruction set.");
-                            return Err(e.into());
-                        }
-                    }
-                },
-                Err(e) => return Err(e.into()),
-            }
-        } else {
-            error!("ArcFace model not found at {:?}. Recognition will fail.", model_path);
-            None
-        };
-
-        Ok(Self {
-            recognition_session,
-        })
+    /// Load the configured recognizer. Fails (closed) when its file is
+    /// missing: without a real model there is no way to tell faces apart, and
+    /// silently falling back to another model would invalidate every profile.
+    pub fn new(models_dir: &Path, model: RecognitionModel, threads: usize) -> Result<Self> {
+        let path = crate::detection::pick_model(models_dir, model.file_stem()).with_context(|| {
+            format!(
+                "The {} recognizer is not installed. Re-run the installer, or set recognition.model = \"{}\" in the config",
+                model.name(),
+                model.other().name()
+            )
+        })?;
+        Self::from_file(&path, threads)
     }
 
-    /// Preprocess image for ArcFace: Resize to 112x112, normalize per-channel (RGB).
-    /// ArcFace standard: normalize each pixel to (value - 127.5) / 128.0 for all 3 channels.
-    /// Do NOT convert to grayscale — ArcFace requires full RGB input.
-    fn preprocess(&self, image: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<Array4<f32>> {
-        let resized = image::imageops::resize(image, INPUT_SIZE.0, INPUT_SIZE.1, image::imageops::FilterType::CatmullRom);
-        
-        let mut array = Array::zeros((1, 3, INPUT_SIZE.1 as usize, INPUT_SIZE.0 as usize));
-        
-        for (x, y, pixel) in resized.enumerate_pixels() {
-            let [r, g, b] = pixel.0;
-            array[[0, 0, y as usize, x as usize]] = (r as f32 - 127.5) / 128.0;
-            array[[0, 1, y as usize, x as usize]] = (g as f32 - 127.5) / 128.0;
-            array[[0, 2, y as usize, x as usize]] = (b as f32 - 127.5) / 128.0;
+    pub fn from_file(path: &Path, threads: usize) -> Result<Self> {
+        let model_id = file_id(path)?;
+        info!("Loading face recognizer {} (model {model_id}, {threads} thread(s))", path.display());
+        let session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level1)?
+            .with_intra_threads(threads.max(1))?
+            .with_inter_threads(1)?
+            .with_parallel_execution(false)?
+            .commit_from_file(path)
+            .with_context(|| format!("Failed to load {}", path.display()))?;
+        Ok(Self { session: Mutex::new(session), model_id })
+    }
+
+    /// L2-normalised embedding of an aligned 112 × 112 face.
+    pub fn embed(&self, face: &RgbImage) -> Result<Vec<f32>> {
+        let resized;
+        let face = if face.dimensions() == (INPUT, INPUT) {
+            face
+        } else {
+            resized = image::imageops::resize(face, INPUT, INPUT, image::imageops::FilterType::CatmullRom);
+            &resized
+        };
+        let tensor = Value::from_array(preprocess(face))?;
+        let mut session = self.session.lock().map_err(|e| anyhow::anyhow!("Recognizer lock poisoned: {e}"))?;
+        let outputs = session.run(ort::inputs![tensor])?;
+        let (_, data) = outputs[0].try_extract_tensor::<f32>()?;
+        let norm = data.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if !norm.is_finite() || norm < 1e-6 {
+            anyhow::bail!("Recognizer produced a degenerate embedding");
         }
-        
-        Ok(array)
+        Ok(data.iter().map(|x| x / norm).collect())
     }
+}
 
-    pub fn get_embedding(&self, image: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> Result<Vec<f32>> {
-        if let Some(session_mutex) = &self.recognition_session {
-            let input_array = self.preprocess(image)?;
-            let input_tensor = Value::from_array(input_array)?;
-            
-            let mut session = session_mutex.lock()
-                .map_err(|e| anyhow::anyhow!("Recognition session lock poisoned: {}", e))?;
+/// Cosine similarity of two normalised embeddings. Embeddings of different
+/// length (another model, or a damaged profile) never match.
+pub fn similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return -1.0;
+    }
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
 
-            let outputs = session.run(ort::inputs![input_tensor])?;
-            
-            let (_shape, data) = outputs[0].try_extract_tensor::<f32>()?;
-            let embedding: Vec<f32> = data.to_vec();
-            
-            // Normalize embedding
-            let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-            Ok(embedding.into_iter().map(|x| x / norm).collect())
-        } else {
-            // Mock embedding for testing if model is missing
-            Ok(vec![0.1; 512])
+/// Best similarity of `emb` against any of `refs` (−1 when `refs` is empty).
+pub fn best_similarity(emb: &[f32], refs: &[Vec<f32>]) -> f32 {
+    refs.iter().map(|r| similarity(emb, r)).fold(-1.0, f32::max)
+}
+
+/// RGB, NCHW, (x − 127.5) / 127.5 as in InsightFace's ArcFace reference code.
+fn preprocess(face: &RgbImage) -> Array4<f32> {
+    let side = INPUT as usize;
+    let plane = side * side;
+    let mut data = vec![0f32; 3 * plane];
+    for (i, px) in face.as_raw().chunks_exact(3).enumerate() {
+        data[i] = (px[0] as f32 - 127.5) / 127.5;
+        data[plane + i] = (px[1] as f32 - 127.5) / 127.5;
+        data[2 * plane + i] = (px[2] as f32 - 127.5) / 127.5;
+    }
+    Array4::from_shape_vec((1, 3, side, side), data).expect("shape matches buffer")
+}
+
+fn file_id(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    Ok(digest.iter().take(8).map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Inference speed of every recognizer file present. Content does not
+    /// affect speed, so a synthetic image stands in for a face.
+    /// `FACEAUTH_MODELS_DIR=$PWD/models cargo test --release -p faceauthd bench_recognizers -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs the model files"]
+    fn bench_recognizers() {
+        let dir = std::path::PathBuf::from(std::env::var("FACEAUTH_MODELS_DIR").unwrap_or_else(|_| "../models".into()));
+        let face = RgbImage::from_fn(112, 112, |x, y| image::Rgb([(x * 2) as u8, (y * 2) as u8, ((x + y) % 256) as u8]));
+        for file in ["arcface_int8.onnx", "arcface.onnx", "arcface_r50_int8.onnx", "arcface_r50.onnx"] {
+            let path = dir.join(file);
+            if !path.exists() {
+                continue;
+            }
+            for threads in [1, 2, 4] {
+                let engine = FaceEngine::from_file(&path, threads).unwrap();
+                for _ in 0..3 {
+                    engine.embed(&face).unwrap();
+                }
+                let runs = 15;
+                let t = std::time::Instant::now();
+                for _ in 0..runs {
+                    engine.embed(&face).unwrap();
+                }
+                let ms = t.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+                println!("BENCH {file:<24} threads={threads}  {ms:7.1} ms/embedding");
+            }
         }
     }
 
+    #[test]
+    fn mismatched_embeddings_never_match() {
+        assert_eq!(similarity(&[1.0, 0.0], &[1.0, 0.0, 0.0]), -1.0);
+        assert_eq!(similarity(&[], &[]), -1.0);
+        assert_eq!(best_similarity(&[1.0], &[]), -1.0);
+    }
 
-    pub fn compare(&self, emb1: &[f32], emb2: &[f32]) -> f32 {
-        // Cosine similarity
-        let dot_product: f32 = emb1.iter().zip(emb2.iter()).map(|(a, b)| a * b).sum();
-        // Since vectors are normalized, dot product is the cosine similarity
-        dot_product
+    #[test]
+    fn identical_embeddings_score_one() {
+        let e = vec![0.6, 0.8];
+        assert!((similarity(&e, &e) - 1.0).abs() < 1e-6);
     }
 }
