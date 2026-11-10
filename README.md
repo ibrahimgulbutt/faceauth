@@ -113,7 +113,8 @@ sessions.
 - **Locked-down daemon:** runs as an unprivileged user in a strict systemd
   sandbox. Callers are identified by the kernel, so nobody can act on another
   user's face data.
-- **Any V4L2 camera,** including infrared cameras selected in the config.
+- **Any V4L2 camera,** including infrared (Windows Hello-style) cameras, which
+  work in the dark. Dim colour images are brightened before recognition.
 - **Rate limiting and audit logging** of every attempt to the system journal.
 
 ## How it works
@@ -230,17 +231,46 @@ with `faceauth doctor`.
 
 ### Infrared cameras
 
-Many laptops have a separate IR camera next to the normal one. Run
-`faceauth cameras` to find it (likely IR cameras are marked), then set
-`device` to its path. Prefer the stable `/dev/v4l/by-id/...` name.
+Many laptops (those with Windows Hello) have an infrared camera next to the
+normal one. It works in complete darkness and is much harder to fool with a
+photo, because it lights your face with its own invisible infrared light (the
+emitter).
 
-Most IR cameras only light up their emitter after
-[linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter)
-configures it. Without the emitter the picture is dark and nothing will be
-recognized.
+**Using it.** The installer asks when it finds one, or set it yourself:
 
-Set up face unlock again after switching cameras: faces look different in
-infrared.
+```toml
+[camera]
+device = "ir"
+```
+
+Then `sudo systemctl restart faceauth` and set up face unlock again (faces
+look different in infrared, so colour face data doesn't carry over).
+`faceauth cameras` lists your cameras and marks the IR ones.
+
+**The emitter.** On Windows a vendor driver switches the emitter on. Linux's
+generic camera driver doesn't know that vendor command, so on many laptops the
+emitter stays off and the IR picture is nearly black. To check, run
+`faceauth benchmark` while looking at the camera: a face brightness below about
+40 means the emitter is off. You can also look at the camera through a phone
+camera while it runs: phone cameras show the emitter as a flickering purple
+light.
+
+If it's off, [linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter)
+finds the right command for your camera and switches it on at boot
+(`sudo linux-enable-ir-emitter configure`, then follow its prompts). If the
+emitter works after that but goes off again later (after suspend, for
+example), copy the values it found into FaceAuth's config, and FaceAuth will
+send them every time it starts the camera:
+
+```toml
+[camera.ir_emitter]
+# Example values only: use the ones linux-enable-ir-emitter found for your camera.
+unit = 14
+selector = 6
+control = [1, 3, 3, 0, 0, 0, 0, 0, 0]
+```
+
+Emitters that flash on every other frame are handled automatically.
 
 ## Troubleshooting
 
@@ -248,9 +278,10 @@ infrared.
 |---|---|
 | **"FaceAuth service isn't running"** in the app, or `faceauth ping` fails | `sudo systemctl status faceauth.service` and `sudo journalctl -u faceauth.service -n 50`. Usually the models are missing in `/usr/share/faceauth/models/`; run `faceauth doctor`. |
 | **Camera unavailable or busy** | Another app (a video call, a browser tab) may be using it. Close it and try again. Check `faceauth cameras` and `camera.device`. |
-| **"Needs to be set up again after an update"** | The recognition model changed. Open the app and choose **Set Up Again**, or run `faceauth enroll`. |
+| **"Needs to be set up again"** | The recognition model or the camera (colour vs infrared) changed, or the face data is from before 1.0. Open the app and choose **Set Up Again**, or run `faceauth enroll`. |
 | **No password dialog appears when setting up** | Your desktop has no polkit authentication agent running (common on minimal window managers). Start one (for example `polkit-gnome` or `hyprpolkitagent`), run `faceauth enroll` in a terminal, or run `sudo faceauth enroll --user $USER`. |
-| **Not recognized in a dark room** | Face a light source. Bad lighting doesn't count toward the lockout. |
+| **Not recognized in a dark room** | Dim light is handled (dark images are brightened), but a colour camera can't see in real darkness. Use the IR camera if you have one (see [Infrared cameras](#infrared-cameras)), or face a light. Bad lighting doesn't count toward the lockout. |
+| **"The infrared light seems to be off"** | The IR camera's emitter isn't on. See [Infrared cameras](#infrared-cameras). |
 | **Recognized less often than you'd like** | Use **Improve Recognition** in the lighting where it fails. Lowering `match_threshold` also helps, but makes it easier for others to pass. |
 | **Something else** | Run `faceauth doctor` and [open an issue](https://github.com/ibrahimgulbutt/faceauth/issues) with its output, your distribution, camera model and the daemon log. |
 

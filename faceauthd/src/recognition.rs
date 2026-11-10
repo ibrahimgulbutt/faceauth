@@ -14,6 +14,8 @@ use std::sync::Mutex;
 pub use crate::config::RecognitionModel;
 
 const INPUT: u32 = 112;
+/// Aligned faces darker than this (mean, 0–255) are brightened.
+const DARK_FACE: f32 = 70.0;
 
 pub struct FaceEngine {
     session: Mutex<Session>,
@@ -50,7 +52,9 @@ impl FaceEngine {
         Ok(Self { session: Mutex::new(session), model_id })
     }
 
-    /// L2-normalised embedding of an aligned 112 × 112 face.
+    /// L2-normalised embedding of an aligned 112 × 112 face. Dark faces are
+    /// brightened first (the same way at setup and at login), which keeps
+    /// scores up in dim light; normally lit faces are untouched.
     pub fn embed(&self, face: &RgbImage) -> Result<Vec<f32>> {
         let resized;
         let face = if face.dimensions() == (INPUT, INPUT) {
@@ -59,6 +63,8 @@ impl FaceEngine {
             resized = image::imageops::resize(face, INPUT, INPUT, image::imageops::FilterType::CatmullRom);
             &resized
         };
+        let brightened = crate::detection::brighten_if_dark(face, DARK_FACE);
+        let face = brightened.as_ref().unwrap_or(face);
         let tensor = Value::from_array(preprocess(face))?;
         let mut session = self.session.lock().map_err(|e| anyhow::anyhow!("Recognizer lock poisoned: {e}"))?;
         let outputs = session.run(ort::inputs![tensor])?;

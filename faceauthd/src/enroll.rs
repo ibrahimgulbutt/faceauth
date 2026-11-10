@@ -30,6 +30,10 @@ const PREVIEW_WIDTH: u32 = 640;
 /// (webcams drop to 15 fps or less in dim light).
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(60);
 const PREVIEW_QUALITY: u8 = 78;
+/// Improving: give up after this many "different person" rejections without a
+/// single accepted sample (~10 s). The saved face data was probably made with
+/// another model or camera, and waiting won't help.
+const MAX_MISMATCHES: u32 = 25;
 
 pub fn steps(mode: EnrollMode) -> Vec<Pose> {
     use Pose::*;
@@ -148,6 +152,7 @@ fn analyse(
     let mut last_seq = 0;
     let mut shown: Option<(usize, Hint)> = None;
     let mut candidate = (Hint::NoFace, 0u32);
+    let mut mismatches = 0u32;
 
     let finish = |f: Finish| {
         shared.stop.store(true, Ordering::Relaxed);
@@ -185,6 +190,13 @@ fn analyse(
             Err(e) => return finish(Finish::Failed(internal(&format!("{e:#}")))),
         };
         let collected = gate.collected.len();
+        if hint == Hint::DifferentPerson && collected == 0 && !existing.is_empty() {
+            mismatches += 1;
+            if mismatches >= MAX_MISMATCHES {
+                warn!("No sample matched the saved face data after {mismatches} tries");
+                return finish(Finish::Failed(EnrollFailure::DoesNotMatch));
+            }
+        }
 
         // Show a problem only once it persists for two analysed frames, so the
         // hint doesn't flicker; progress is shown immediately.
@@ -238,8 +250,10 @@ impl<'a> Gate<'a> {
             return Ok(Hint::MoveCloser);
         }
         let brightness = detection::face_brightness(frame, face);
-        if brightness < 45.0 {
-            return Ok(Hint::TooDark);
+        // Dim faces are brightened before recognition, so only reject the
+        // really dark ones (mostly noise).
+        if brightness < 28.0 {
+            return Ok(if self.p.infrared { Hint::IrLightOff } else { Hint::TooDark });
         }
         if brightness > 215.0 {
             return Ok(Hint::TooBright);

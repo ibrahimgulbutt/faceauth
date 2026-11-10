@@ -101,10 +101,14 @@ pub struct UserStatus {
     /// Unix seconds; 0 when unknown.
     pub created: u64,
     pub updated: u64,
-    /// False when the profile was made with a different recognition model.
+    /// False when the profile was made with a different recognition model
+    /// or kind of camera (colour vs infrared), so it can't be used.
     pub model_current: bool,
     /// Human-readable name of the camera the daemon will use.
     pub camera: Option<String>,
+    /// The camera in use is infrared.
+    #[serde(default)]
+    pub infrared: bool,
     /// Recognizer in use, e.g. "Accurate (ResNet50)".
     pub recognizer: String,
 }
@@ -148,7 +152,7 @@ impl AuthOutcome {
             }
             AuthOutcome::NotEnrolled => "Face unlock is not set up".into(),
             AuthOutcome::ModelChanged => {
-                "Face unlock needs to be set up again after an update".into()
+                "Face unlock needs to be set up again (the camera or face model changed)".into()
             }
             AuthOutcome::CameraUnavailable => "Camera is unavailable".into(),
             AuthOutcome::Busy => "Face unlock is busy".into(),
@@ -204,6 +208,8 @@ pub enum Hint {
     TooFar,
     MoveSlightly,
     DifferentPerson,
+    /// Infrared camera, face nearly black: its IR light is not on.
+    IrLightOff,
 }
 
 impl Hint {
@@ -220,6 +226,7 @@ impl Hint {
             Hint::TooFar => "Not quite so far",
             Hint::MoveSlightly => "Move your head slightly",
             Hint::DifferentPerson => "Only the account owner should be in view",
+            Hint::IrLightOff => "The infrared light seems to be off — see “Infrared cameras” in the README",
         }
     }
 
@@ -273,6 +280,9 @@ pub enum EnrollFailure {
     NotEnrolled,
     /// Another setup or removal for this user is already running.
     InProgress,
+    /// Improving: the face in view never matched the saved face data (made
+    /// with another model or camera, or someone else is in view).
+    DoesNotMatch,
     Internal { message: String },
 }
 
@@ -293,6 +303,9 @@ impl EnrollFailure {
             }
             EnrollFailure::NotEnrolled => "Face unlock is not set up yet".into(),
             EnrollFailure::InProgress => "Face unlock setup is already running".into(),
+            EnrollFailure::DoesNotMatch => {
+                "This face doesn't match your saved face data. Set up again to start fresh".into()
+            }
             EnrollFailure::Internal { message } => format!("Something went wrong: {message}"),
         }
     }
@@ -320,6 +333,12 @@ pub struct BenchmarkReport {
     pub detection_ms: f32,
     pub recognition_ms: f32,
     pub total_ms: f32,
+    /// Mean brightness (0–255) of the face, if one was in view.
+    #[serde(default)]
+    pub face_brightness: Option<f32>,
+    /// The camera is infrared.
+    #[serde(default)]
+    pub infrared: bool,
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

@@ -9,7 +9,8 @@ overview see [ARCHITECTURE.md](ARCHITECTURE.md).
 | Crate | Used for |
 |---|---|
 | `ort` (ONNX Runtime) | Running the detection and recognition models |
-| `nokhwa` | V4L2 camera capture (MJPEG, YUYV, NV12, GREY) |
+| `nokhwa` | V4L2 colour capture (MJPEG, YUYV, NV12) |
+| `v4l` | Device probing, greyscale (IR) capture, the IR emitter control |
 | `image`, `ndarray` | Image manipulation, tensors, JPEG preview encoding |
 | `aes-gcm`, `sha2` | Encrypted profiles; model IDs |
 | `tokio` | The daemon's socket server and request streaming |
@@ -23,7 +24,11 @@ overview see [ARCHITECTURE.md](ARCHITECTURE.md).
 ### 1. Capture
 
 - **Camera choice.** `camera.device = "auto"` picks the first device with a
-  colour format; a path selects one explicitly, for example an IR camera.
+  colour format, `"ir"` the first infrared one (UVC interface or device name
+  says IR, or greyscale only); a path selects one explicitly. Devices are
+  probed with `v4l`. Greyscale streams are read with `v4l` directly, because
+  nokhwa 0.10 asks V4L2 for the FourCC `GRAY` instead of `GREY` and can't open
+  them.
 - **Format choice, in order:**
   1. MJPEG closest to 1280×720;
   2. YUYV closest to 640×480;
@@ -31,6 +36,13 @@ overview see [ARCHITECTURE.md](ARCHITECTURE.md).
   4. anything else.
 
   GREY (infrared) frames are expanded to three channels.
+- **IR emitter.** If `camera.ir_emitter` is set, its UVC extension-unit control
+  (`UVCIOC_CTRL_QUERY`, `UVC_SET_CUR`) is sent each time the stream starts.
+- **Exposure.** After the warm-up, while the picture is dark (mean < 70) and
+  still getting brighter, up to 15 more frames are read so auto-exposure can
+  catch up.
+- **Flashing emitters.** For IR, the brightness of six frames is checked; if it
+  alternates bright/dark, dark frames are skipped from then on.
 - **Adaptive warm-up.** The daemon remembers when the camera was last closed,
   using wall-clock time so a suspend counts as idle:
 
@@ -44,6 +56,10 @@ overview see [ARCHITECTURE.md](ARCHITECTURE.md).
   `sequence_interval_ms`.
 - **Brightness guard.** A frame whose mean brightness is outside a usable range
   ends the attempt as `BadLighting`.
+- **Low light.** Frames darker than mean 60 are gamma-brightened before
+  detection, and aligned faces darker than 70 before recognition (the same at
+  setup and login). Gamma lifts dark detail towards a mean of 110 and leaves
+  normally lit images untouched.
 
 ### 2. Detection: SCRFD-500MF (`det_500m.onnx`, from InsightFace `buffalo_sc`)
 
@@ -117,7 +133,8 @@ Enrollment runs entirely in the daemon. The full flow is in
 - **A sample is accepted only when:**
   - there is exactly one face;
   - it is at least `min_face_size` px wide;
-  - face brightness is 45–215;
+  - face brightness is 28–215 (dim faces are brightened; below 28 an IR camera
+    reports that its light seems off);
   - the pose matches;
   - similarity is ≥ 0.40 to the samples already collected (same person);
   - similarity is ≤ 0.92 to each of them (not a duplicate);
@@ -139,7 +156,8 @@ Path: `/var/lib/faceauth/<user>/models.enc`, owned by `faceauth`, mode 0600.
 
 - **Model ID.** `model_id` is the first 16 hex characters of the SHA-256 of the
   recognition model file. A profile whose ID differs from the installed model is
-  reported as `ModelChanged`. Profiles from before 1.0 have no ID; they were
+  reported as `ModelChanged`, as is a profile made with the other kind of
+  camera (the profile records `infrared`). Profiles from before 1.0 have no ID; they were
   made with the old INT8 MobileFaceNet file, which is no longer installed, so
   they are reported as `ModelChanged` too.
 - **What the encryption protects.** GCM authenticates the ciphertext, so a

@@ -5,13 +5,22 @@
 # Check them with:     faceauth doctor
 
 [camera]
-# "auto" picks the first camera that offers a colour format (MJPEG, YUYV, NV12).
-# To use a specific camera — for example an infrared one — give its path.
-# Stable paths under /dev/v4l/by-id/ survive reboots and replugging.
-# List cameras with:  faceauth cameras
+# "auto" picks the first colour camera (MJPEG, YUYV, NV12); "ir" picks the
+# first infrared camera, which works in the dark once its IR light is on.
+# A path selects a specific camera; stable paths under /dev/v4l/by-id/ survive
+# reboots and replugging. List cameras with:  faceauth cameras
+# Changing camera means setting up face unlock again.
 device = "auto"
-# device = "/dev/video2"
+# device = "ir"
 # device = "/dev/v4l/by-id/usb-Integrated_Camera_IR-video-index0"
+
+# Only if your IR camera's light stays off: the vendor command that switches
+# it on, sent every time the camera starts. Get the values from
+# linux-enable-ir-emitter (see "Infrared cameras" in the README).
+# [camera.ir_emitter]          (example values; yours will differ)
+# unit = 14
+# selector = 6
+# control = [1, 3, 3, 0, 0, 0, 0, 0, 0]
 
 # Frames discarded after a cold camera start while auto-exposure settles.
 # Warm starts (camera used in the last few minutes) discard fewer.

@@ -50,6 +50,8 @@ struct Daemon {
     config: Config,
     camera: Mutex<CameraManager>,
     camera_label: Mutex<Option<String>>,
+    /// The camera is infrared (decided at startup).
+    infrared: bool,
     detector: FaceDetector,
     engine: FaceEngine,
     storage: SecureStorage,
@@ -61,7 +63,12 @@ struct Daemon {
 
 impl Daemon {
     fn pipeline(&self) -> Pipeline<'_> {
-        Pipeline { config: &self.config, detector: &self.detector, engine: &self.engine }
+        Pipeline { config: &self.config, detector: &self.detector, engine: &self.engine, infrared: self.infrared }
+    }
+
+    /// The profile was made with this recognizer and this kind of camera.
+    fn profile_usable(&self, p: &UserProfile) -> bool {
+        p.usable_with(&self.engine.model_id, self.infrared)
     }
 
     fn camera_label(&self) -> Option<String> {
@@ -100,10 +107,11 @@ fn main() -> Result<()> {
     let detector = FaceDetector::new(&models, config.detection.confidence_threshold)?;
     let engine = FaceEngine::new(&models, config.recognition.model, config.recognition.effective_threads())?;
     let storage = SecureStorage::new(config::state_dir())?;
-    let camera = CameraManager::new(&config.camera.device)?;
+    let camera = CameraManager::new(&config.camera.device, config.camera.ir_emitter.clone())?;
     let label = camera.describe();
+    let infrared = camera.is_infrared();
     match &label {
-        Some(l) => info!("Camera: {l}"),
+        Some(l) => info!("Camera: {l}{}", if infrared { " [infrared]" } else { "" }),
         None => warn!("No camera found yet; will look again on first use"),
     }
 
@@ -112,6 +120,7 @@ fn main() -> Result<()> {
         config,
         camera: Mutex::new(camera),
         camera_label: Mutex::new(label),
+        infrared,
         detector,
         engine,
         storage,
@@ -271,7 +280,7 @@ fn status(d: &Daemon, peer: Peer) -> Response {
     };
     let (enrolled, samples, created, updated, model_current) = match &profile {
         Some(p) if !p.embeddings.is_empty() => {
-            (true, p.embeddings.len(), p.created, p.updated, p.model_matches(&d.engine.model_id))
+            (true, p.embeddings.len(), p.created, p.updated, d.profile_usable(p))
         }
         _ => (false, 0, 0, 0, true),
     };
@@ -284,6 +293,7 @@ fn status(d: &Daemon, peer: Peer) -> Response {
         updated,
         model_current,
         camera: d.camera_label(),
+        infrared: d.infrared,
         recognizer: d.config.recognition.model.describe().to_string(),
     })
 }
@@ -295,7 +305,7 @@ fn list_enrolled(d: &Daemon, peer: Peer) -> Response {
                 .into_iter()
                 .filter(|p| peer.may_act_for(&p.user))
                 .map(|p| EnrolledUser {
-                    model_current: p.model_matches(&d.engine.model_id),
+                    model_current: d.profile_usable(&p),
                     samples: p.embeddings.len(),
                     updated: p.updated,
                     user: p.user,
@@ -324,8 +334,14 @@ async fn authenticate(d: &Arc<Daemon>, peer: Peer, user: String, wr: &mut OwnedW
             return send(wr, &Response::Error { message: "face data could not be read".into() }).await;
         }
     };
-    if !profile.model_matches(&d.engine.model_id) {
-        warn!("{user} was enrolled with model {:?}, installed is {}", profile.model_id, d.engine.model_id);
+    if !d.profile_usable(&profile) {
+        warn!(
+            "{user} was set up with model {:?} on a {} camera; now model {} on a {} camera",
+            profile.model_id,
+            if profile.infrared { "infrared" } else { "colour" },
+            d.engine.model_id,
+            if d.infrared { "infrared" } else { "colour" }
+        );
         return send(wr, &outcome(AuthOutcome::ModelChanged)).await;
     }
     if let Some(left) = d.limiter.locked_for(&user) {
@@ -447,9 +463,7 @@ async fn enroll_session(
     };
     let base: Vec<Vec<f32>> = match (mode, &existing) {
         (EnrollMode::Append, None) => return send(wr, &fail(EnrollFailure::NotEnrolled)).await,
-        (EnrollMode::Append, Some(p)) if !p.model_matches(&d.engine.model_id) => {
-            return send(wr, &fail(EnrollFailure::Internal { message: "the face model changed; set up again instead".into() })).await
-        }
+        (EnrollMode::Append, Some(p)) if !d.profile_usable(p) => return send(wr, &fail(EnrollFailure::DoesNotMatch)).await,
         (EnrollMode::Append, Some(p)) if p.embeddings.len() + enroll::steps(mode).len() > MAX_SAMPLES => {
             return send(wr, &fail(EnrollFailure::Full { max: MAX_SAMPLES })).await
         }
@@ -500,6 +514,7 @@ async fn enroll_session(
                 },
                 updated: now(),
                 model_id: Some(d.engine.model_id.clone()),
+                infrared: d.infrared,
                 embeddings: base.into_iter().chain(samples).collect(),
             };
             let total = profile.embeddings.len();

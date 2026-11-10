@@ -1,35 +1,44 @@
 //! Camera selection, format negotiation and capture.
 //!
 //! `camera.device = "auto"` uses the first V4L2 device that offers a colour
-//! format; a path selects a device explicitly (that is how IR cameras are
-//! used). Greyscale (IR) frames are expanded to RGB so the rest of the
+//! format, `"ir"` the first infrared one, and a path selects a device
+//! explicitly. Greyscale (IR) frames are expanded to RGB so the rest of the
 //! pipeline is format-agnostic.
+//!
+//! Devices are probed with the `v4l` crate. Colour streams go through nokhwa;
+//! greyscale streams are read with `v4l` directly, because nokhwa 0.10 asks
+//! V4L2 for the FourCC "GRAY" instead of "GREY" and so can't open IR cameras.
+//!
+//! Infrared cameras need their IR light (emitter) on to see in the dark. Many
+//! switch it on by themselves; others need a vendor command, which
+//! `camera.ir_emitter` sends every time the stream starts. If the emitter
+//! flashes on every other frame, the dark frames are skipped.
 
+use crate::config::IrEmitter;
 use anyhow::{bail, Context, Result};
 use faceauth_core::CameraDevice;
 use image::{GrayImage, RgbImage};
 use log::{info, warn};
 use nokhwa::pixel_format::RgbFormat;
-use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
+use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution};
 use nokhwa::Camera;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
-const ALL_FORMATS: [FrameFormat; 6] = [
-    FrameFormat::MJPEG,
-    FrameFormat::YUYV,
-    FrameFormat::NV12,
-    FrameFormat::GRAY,
-    FrameFormat::RAWRGB,
-    FrameFormat::RAWBGR,
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Selection {
+    /// First colour camera.
     Auto,
+    /// First infrared camera.
+    Infrared,
     Index(u32),
 }
+
+/// Mean brightness below which the exposure is given extra frames to settle.
+const DARK_FRAME: f32 = 70.0;
+/// At most this many extra frames while the exposure settles.
+const MAX_EXPOSURE_FRAMES: usize = 15;
 
 pub struct CameraManager {
     selection: Selection,
@@ -40,27 +49,43 @@ pub struct CameraManager {
     /// because CLOCK_MONOTONIC does not advance during suspend, and a long
     /// sleep is exactly when the sensor needs a longer warm-up.
     last_closed: Mutex<Option<SystemTime>>,
+    emitter: Option<IrEmitter>,
 }
 
 impl CameraManager {
-    pub fn new(device: &str) -> Result<Self> {
-        let selection = if device.trim().eq_ignore_ascii_case("auto") {
+    pub fn new(device: &str, emitter: Option<IrEmitter>) -> Result<Self> {
+        let device = device.trim();
+        let selection = if device.eq_ignore_ascii_case("auto") {
             Selection::Auto
+        } else if device.eq_ignore_ascii_case("ir") || device.eq_ignore_ascii_case("infrared") {
+            Selection::Infrared
         } else {
-            Selection::Index(index_from_path(Path::new(device.trim()))?)
+            Selection::Index(index_from_path(Path::new(device))?)
         };
-        Ok(Self { selection, resolved: Mutex::new(None), last_closed: Mutex::new(None) })
+        Ok(Self { selection, resolved: Mutex::new(None), last_closed: Mutex::new(None), emitter })
+    }
+
+    /// Whether the camera in use is infrared. Profiles made with an IR camera
+    /// can't be compared with colour images and vice versa.
+    pub fn is_infrared(&self) -> bool {
+        match self.selection {
+            Selection::Infrared => true,
+            _ => self
+                .selected_index()
+                .and_then(|i| list_devices().into_iter().find(|d| d.index == i))
+                .is_some_and(|d| d.infrared),
+        }
     }
 
     /// Index of the device this manager would use right now, if any.
     pub fn selected_index(&self) -> Option<u32> {
         match self.selection {
             Selection::Index(i) => Some(i),
-            Selection::Auto => {
+            Selection::Auto | Selection::Infrared => {
                 if let Some((i, _)) = *self.resolved.lock().unwrap_or_else(|p| p.into_inner()) {
                     return Some(i);
                 }
-                list_devices().into_iter().find(|d| d.colour).map(|d| d.index)
+                self.candidates().first().copied()
             }
         }
     }
@@ -93,7 +118,7 @@ impl CameraManager {
             _ => (300, configured_warmup),
         };
 
-        let mut camera = match self.open() {
+        let mut backend = match self.open() {
             Ok(c) => c,
             Err(e) => {
                 // The device may have been renumbered or briefly busy: forget
@@ -104,8 +129,7 @@ impl CameraManager {
                 self.open()?
             }
         };
-        camera.open_stream().context("Failed to start the camera stream")?;
-        let fmt = camera.camera_format();
+        let fmt = backend.start()?;
         info!(
             "Camera streaming {}x{} {:?} @{}fps (idle {}, settle {settle_ms} ms, warm-up {warmup} frames)",
             fmt.width(),
@@ -114,37 +138,49 @@ impl CameraManager {
             fmt.frame_rate(),
             if idle_secs == u64::MAX { "∞".to_string() } else { format!("{idle_secs}s") },
         );
+        if let (Some(emitter), Some((index, _))) = (&self.emitter, *self.resolved.lock().unwrap_or_else(|p| p.into_inner())) {
+            if let Err(e) = enable_emitter(index, emitter) {
+                warn!("Could not switch on the IR emitter: {e:#}");
+            }
+        }
         if settle_ms > 0 {
             std::thread::sleep(Duration::from_millis(settle_ms));
         }
-        let mut active = ActiveCamera { camera, manager: self };
+        let infrared = fmt.format() == FrameFormat::GRAY;
+        let mut active = ActiveCamera { backend, manager: self, strobe: None };
         for _ in 0..warmup {
-            let _ = active.camera.frame();
+            active.backend.skip_frame();
         }
+        active.settle(infrared);
         Ok(active)
     }
 
-    fn open(&self) -> Result<Camera> {
-        let cached = *self.resolved.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((index, fmt)) = cached {
-            return open_with_format(index, fmt);
-        }
-        let candidates: Vec<u32> = match self.selection {
+    fn candidates(&self) -> Vec<u32> {
+        match self.selection {
             Selection::Index(i) => vec![i],
             Selection::Auto => list_devices().into_iter().filter(|d| d.colour).map(|d| d.index).collect(),
-        };
+            Selection::Infrared => list_devices().into_iter().filter(|d| d.infrared).map(|d| d.index).collect(),
+        }
+    }
+
+    fn open(&self) -> Result<Backend> {
+        let cached = *self.resolved.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((index, fmt)) = cached {
+            return Backend::open(index, fmt);
+        }
+        let candidates = self.candidates();
         if candidates.is_empty() {
-            bail!("No camera found");
+            bail!(if self.selection == Selection::Infrared { "No infrared camera found" } else { "No camera found" });
         }
         let mut last_err = None;
         for index in candidates {
             match probe(index).and_then(|formats| {
                 let fmt = choose_format(&formats).context("Camera offers no usable format")?;
-                Ok((open_with_format(index, fmt)?, fmt))
+                Ok((Backend::open(index, fmt)?, fmt))
             }) {
-                Ok((camera, fmt)) => {
+                Ok((backend, fmt)) => {
                     *self.resolved.lock().unwrap_or_else(|p| p.into_inner()) = Some((index, fmt));
-                    return Ok(camera);
+                    return Ok(backend);
                 }
                 Err(e) => last_err = Some(e.context(format!("/dev/video{index}"))),
             }
@@ -153,26 +189,175 @@ impl CameraManager {
     }
 }
 
+/// An opened camera: nokhwa for colour formats, `v4l` for greyscale.
+enum Backend {
+    Nokhwa(Box<Camera>),
+    Grey(GreyCamera),
+}
+
+struct GreyCamera {
+    device: v4l::Device,
+    format: CameraFormat,
+    stream: Option<GreyStream>,
+}
+
+struct GreyStream {
+    stream: v4l::io::mmap::Stream<'static>,
+    width: u32,
+    height: u32,
+    stride: u32,
+}
+
+impl Backend {
+    fn open(index: u32, fmt: CameraFormat) -> Result<Self> {
+        if fmt.format() == FrameFormat::GRAY {
+            let device = v4l::Device::new(index as usize).with_context(|| format!("opening /dev/video{index}"))?;
+            return Ok(Backend::Grey(GreyCamera { device, format: fmt, stream: None }));
+        }
+        let wanted = [fmt.format()];
+        let request = RequestedFormat::with_formats(RequestedFormatType::Exact(fmt), &wanted);
+        Ok(Backend::Nokhwa(Box::new(Camera::new(CameraIndex::Index(index), request)?)))
+    }
+
+    /// Start streaming; returns the format actually in use.
+    fn start(&mut self) -> Result<CameraFormat> {
+        match self {
+            Backend::Nokhwa(camera) => {
+                camera.open_stream().context("Failed to start the camera stream")?;
+                Ok(camera.camera_format())
+            }
+            Backend::Grey(cam) => {
+                use v4l::video::Capture;
+                let want = v4l::Format::new(cam.format.width(), cam.format.height(), v4l::FourCC::new(b"GREY"));
+                let got = cam.device.set_format(&want).context("Failed to set the greyscale format")?;
+                if &got.fourcc.repr != b"GREY" {
+                    bail!("Camera refused the greyscale format (got {})", got.fourcc);
+                }
+                if let Err(e) = cam.device.set_params(&v4l::video::capture::Parameters::with_fps(cam.format.frame_rate())) {
+                    warn!("Could not set {} fps: {e}", cam.format.frame_rate());
+                }
+                let mut stream = v4l::io::mmap::Stream::with_buffers(&cam.device, v4l::buffer::Type::VideoCapture, 4)
+                    .context("Failed to start the camera stream")?;
+                stream.set_timeout(Duration::from_secs(2));
+                let stride = got.stride.max(got.width);
+                cam.stream = Some(GreyStream { stream, width: got.width, height: got.height, stride });
+                Ok(CameraFormat::new(Resolution::new(got.width, got.height), FrameFormat::GRAY, cam.format.frame_rate()))
+            }
+        }
+    }
+
+    fn skip_frame(&mut self) {
+        match self {
+            Backend::Nokhwa(camera) => {
+                let _ = camera.frame();
+            }
+            Backend::Grey(_) => {
+                let _ = self.read();
+            }
+        }
+    }
+
+    fn read(&mut self) -> Result<RgbImage> {
+        match self {
+            Backend::Nokhwa(camera) => {
+                let frame = camera.frame().context("Failed to read a camera frame")?;
+                Ok(frame.decode_image::<RgbFormat>()?)
+            }
+            Backend::Grey(cam) => {
+                use v4l::io::traits::CaptureStream;
+                let s = cam.stream.as_mut().context("Camera stream not started")?;
+                let (w, h, stride) = (s.width, s.height, s.stride);
+                let (data, _) = s.stream.next().context("Failed to read a camera frame")?;
+                let needed = (stride * (h - 1) + w) as usize;
+                if data.len() < needed {
+                    bail!("Short greyscale frame ({} of {needed} bytes)", data.len());
+                }
+                let mut grey = Vec::with_capacity((w * h) as usize);
+                for row in data.chunks(stride as usize).take(h as usize) {
+                    grey.extend_from_slice(&row[..w as usize]);
+                }
+                let grey = GrayImage::from_raw(w, h, grey).context("Bad greyscale frame")?;
+                Ok(image::DynamicImage::ImageLuma8(grey).to_rgb8())
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        match self {
+            Backend::Nokhwa(camera) => {
+                if let Err(e) = camera.stop_stream() {
+                    warn!("Failed to stop camera stream: {e}");
+                }
+            }
+            // Dropping the mmap stream stops it and frees the buffers.
+            Backend::Grey(cam) => cam.stream = None,
+        }
+    }
+}
+
 pub struct ActiveCamera<'a> {
-    camera: Camera,
+    backend: Backend,
     manager: &'a CameraManager,
+    /// Brightness of a lit frame, when the IR emitter flashes on every other
+    /// frame; dark frames are then skipped.
+    strobe: Option<f32>,
 }
 
 impl ActiveCamera<'_> {
-    pub fn capture_frame(&mut self) -> Result<RgbImage> {
-        let frame = self.camera.frame().context("Failed to read a camera frame")?;
-        if frame.source_frame_format() == FrameFormat::GRAY {
-            let res = frame.resolution();
-            let (w, h) = (res.width(), res.height());
-            let data = frame.buffer();
-            let needed = (w * h) as usize;
-            if data.len() < needed {
-                bail!("Short greyscale frame ({} of {needed} bytes)", data.len());
+    /// After the warm-up: give the auto-exposure more frames while the picture
+    /// is still dark and getting brighter, and detect a flashing IR emitter.
+    fn settle(&mut self, infrared: bool) {
+        let Ok(first) = self.read_frame() else { return };
+        let mut levels = vec![mean_brightness(&first)];
+        let needed = if infrared { 6 } else { 1 };
+        while levels.len() < MAX_EXPOSURE_FRAMES {
+            // Pairs of frames, so a flashing IR emitter doesn't look like change.
+            let n = levels.len();
+            let recent = if n >= 2 { levels[n - 1].max(levels[n - 2]) } else { levels[0] };
+            let rising = n < 4 || recent > levels[n - 3].max(levels[n - 4]) + 1.0;
+            let dark_and_rising = recent < DARK_FRAME && rising;
+            if levels.len() >= needed && !dark_and_rising {
+                break;
             }
-            let grey = GrayImage::from_raw(w, h, data[..needed].to_vec()).context("Bad greyscale frame")?;
-            return Ok(image::DynamicImage::ImageLuma8(grey).to_rgb8());
+            match self.read_frame() {
+                Ok(f) => levels.push(mean_brightness(&f)),
+                Err(_) => break,
+            }
         }
-        Ok(frame.decode_image::<RgbFormat>()?)
+        if infrared {
+            self.strobe = strobe_level(&levels);
+            if let Some(lit) = self.strobe {
+                info!("IR emitter flashes every other frame (lit ≈ {lit:.0}); skipping dark frames");
+            }
+        }
+        let last = levels[levels.len() - 1];
+        if levels.len() > needed {
+            info!("Exposure settled over {} frames (brightness {:.0} → {last:.0})", levels.len(), levels[0]);
+        } else {
+            info!("Picture brightness {last:.0}");
+        }
+    }
+
+    pub fn capture_frame(&mut self) -> Result<RgbImage> {
+        let Some(lit) = self.strobe else { return self.read_frame() };
+        // With a flashing emitter every other frame is dark; take a lit one.
+        let mut best = self.read_frame()?;
+        for _ in 0..2 {
+            let level = mean_brightness(&best);
+            if level >= lit * 0.7 {
+                self.strobe = Some(lit * 0.8 + level * 0.2);
+                break;
+            }
+            let next = self.read_frame()?;
+            if mean_brightness(&next) > level {
+                best = next;
+            }
+        }
+        Ok(best)
+    }
+
+    fn read_frame(&mut self) -> Result<RgbImage> {
+        self.backend.read()
     }
 
     /// Capture `count` frames, `interval_ms` apart. Individual failed frames
@@ -196,9 +381,7 @@ impl ActiveCamera<'_> {
 
 impl Drop for ActiveCamera<'_> {
     fn drop(&mut self) {
-        if let Err(e) = self.camera.stop_stream() {
-            warn!("Failed to stop camera stream: {e}");
-        }
+        self.backend.stop();
         *self.manager.last_closed.lock().unwrap_or_else(|p| p.into_inner()) = Some(SystemTime::now());
     }
 }
@@ -242,7 +425,13 @@ pub fn list_devices() -> Vec<Device> {
     indices
         .into_iter()
         .filter_map(|index| {
-            let formats: Vec<FrameFormat> = probe(index).ok()?.iter().map(|f| f.format()).collect();
+            let formats: Vec<FrameFormat> = match probe(index) {
+                Ok(f) => f.iter().map(|f| f.format()).collect(),
+                Err(e) => {
+                    log::debug!("/dev/video{index}: {e:#}");
+                    return None;
+                }
+            };
             if formats.is_empty() {
                 return None;
             }
@@ -258,6 +447,70 @@ pub fn list_devices() -> Vec<Device> {
         .collect()
 }
 
+/// Mean brightness of a frame, sampling every 7th byte.
+pub fn mean_brightness(img: &RgbImage) -> f32 {
+    let raw = img.as_raw();
+    if raw.is_empty() {
+        return 0.0;
+    }
+    let (sum, n) = raw.iter().step_by(7).fold((0u64, 0u64), |(s, n), &v| (s + v as u64, n + 1));
+    sum as f32 / n as f32
+}
+
+/// Brightness of the lit frames when the levels alternate bright/dark (an IR
+/// emitter flashing every other frame), else None.
+fn strobe_level(levels: &[f32]) -> Option<f32> {
+    if levels.len() < 4 {
+        return None;
+    }
+    let tail = &levels[levels.len() - 4..];
+    let alternating = tail.windows(2).all(|w| {
+        let (hi, lo) = if w[0] > w[1] { (w[0], w[1]) } else { (w[1], w[0]) };
+        hi > lo * 1.5 + 5.0
+    }) && tail.windows(3).all(|w| (w[0] > w[1]) == (w[2] > w[1]));
+    alternating.then(|| tail.iter().cloned().fold(0.0, f32::max))
+}
+
+/// Send the vendor command that switches on an IR emitter (a UVC extension
+/// unit control, as found by tools such as linux-enable-ir-emitter).
+fn enable_emitter(index: u32, emitter: &IrEmitter) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    #[repr(C)]
+    struct UvcXuControlQuery {
+        unit: u8,
+        selector: u8,
+        query: u8,
+        size: u16,
+        data: *mut u8,
+    }
+    // _IOWR('u', 0x21, struct uvc_xu_control_query)
+    const UVCIOC_CTRL_QUERY: libc::c_ulong = (3 << 30)
+        | ((std::mem::size_of::<UvcXuControlQuery>() as libc::c_ulong) << 16)
+        | ((b'u' as libc::c_ulong) << 8)
+        | 0x21;
+    const UVC_SET_CUR: u8 = 0x01;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!("/dev/video{index}"))
+        .with_context(|| format!("opening /dev/video{index}"))?;
+    let mut data = emitter.control.clone();
+    let mut query = UvcXuControlQuery {
+        unit: emitter.unit,
+        selector: emitter.selector,
+        query: UVC_SET_CUR,
+        size: data.len() as u16,
+        data: data.as_mut_ptr(),
+    };
+    // SAFETY: `query` points at a live buffer of `size` bytes for the call.
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), UVCIOC_CTRL_QUERY as _, &mut query) };
+    if rc != 0 {
+        bail!("UVC control (unit {}, selector {}) failed: {}", emitter.unit, emitter.selector, std::io::Error::last_os_error());
+    }
+    info!("IR emitter switched on (unit {}, selector {})", emitter.unit, emitter.selector);
+    Ok(())
+}
+
 pub fn describe_devices(selected: Option<u32>) -> Vec<CameraDevice> {
     list_devices()
         .into_iter()
@@ -271,8 +524,18 @@ pub fn describe_devices(selected: Option<u32>) -> Vec<CameraDevice> {
         .collect()
 }
 
+/// The UVC interface string when there is one ("Integrated IR Camera"): it
+/// tells the colour and IR halves of a combined module apart, which the
+/// device name ("Integrated RGB Camera" for both) often doesn't.
 fn device_name(index: u32) -> String {
-    std::fs::read_to_string(format!("/sys/class/video4linux/video{index}/name"))
+    let sys = format!("/sys/class/video4linux/video{index}");
+    if let Ok(iface) = std::fs::read_to_string(format!("{sys}/device/interface")) {
+        let iface = iface.trim();
+        if !iface.is_empty() {
+            return iface.to_string();
+        }
+    }
+    std::fs::read_to_string(format!("{sys}/name"))
         .map(|s| clean_name(s.trim()))
         .unwrap_or_else(|_| format!("Camera {index}"))
 }
@@ -297,16 +560,49 @@ fn index_from_path(path: &Path) -> Result<u32> {
         .with_context(|| format!("camera.device {} is not a /dev/videoN device", path.display()))
 }
 
+/// Every (format, size, frame rate) a capture device offers. Metadata nodes
+/// list no capture formats and come back empty.
 fn probe(index: u32) -> Result<Vec<CameraFormat>> {
-    let request = RequestedFormat::with_formats(RequestedFormatType::None, &ALL_FORMATS);
-    let mut camera = Camera::new(CameraIndex::Index(index), request)?;
-    Ok(camera.compatible_camera_formats()?)
+    use v4l::frameinterval::FrameIntervalEnum;
+    use v4l::video::Capture;
+    let dev = v4l::Device::new(index as usize).with_context(|| format!("opening /dev/video{index}"))?;
+    let mut out = Vec::new();
+    for desc in dev.enum_formats()? {
+        let Some(ff) = frame_format(&desc.fourcc.repr) else { continue };
+        for size in dev.enum_framesizes(desc.fourcc)? {
+            for d in size.size.to_discrete() {
+                let intervals = dev.enum_frameintervals(desc.fourcc, d.width, d.height).unwrap_or_default();
+                let mut rates: Vec<u32> = intervals
+                    .iter()
+                    .filter_map(|i| match &i.interval {
+                        FrameIntervalEnum::Discrete(f) if f.numerator > 0 => Some(f.denominator / f.numerator),
+                        FrameIntervalEnum::Stepwise(s) if s.min.numerator > 0 => Some(s.min.denominator / s.min.numerator),
+                        _ => None,
+                    })
+                    .filter(|&fps| fps > 0)
+                    .collect();
+                if rates.is_empty() {
+                    rates.push(15);
+                }
+                for fps in rates {
+                    out.push(CameraFormat::new(Resolution::new(d.width, d.height), ff, fps));
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
-fn open_with_format(index: u32, fmt: CameraFormat) -> Result<Camera> {
-    let wanted = [fmt.format()];
-    let request = RequestedFormat::with_formats(RequestedFormatType::Exact(fmt), &wanted);
-    Ok(Camera::new(CameraIndex::Index(index), request)?)
+fn frame_format(fourcc: &[u8; 4]) -> Option<FrameFormat> {
+    Some(match fourcc {
+        b"MJPG" => FrameFormat::MJPEG,
+        b"YUYV" => FrameFormat::YUYV,
+        b"NV12" => FrameFormat::NV12,
+        b"GREY" => FrameFormat::GRAY,
+        b"RGB3" => FrameFormat::RAWRGB,
+        b"BGR3" => FrameFormat::RAWBGR,
+        _ => return None,
+    })
 }
 
 /// MJPEG near 1280×720 → YUYV near 640×480 → NV12 → greyscale (IR) near
@@ -345,7 +641,6 @@ fn choose_format(formats: &[CameraFormat]) -> Option<CameraFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nokhwa::utils::Resolution;
 
     fn fmt(ff: FrameFormat, w: u32, h: u32, fps: u32) -> CameraFormat {
         CameraFormat::new(Resolution::new(w, h), ff, fps)
@@ -373,6 +668,14 @@ mod tests {
     fn uses_greyscale_for_ir_only_devices() {
         let formats = [fmt(FrameFormat::GRAY, 640, 360, 30), fmt(FrameFormat::GRAY, 340, 340, 15)];
         assert_eq!(choose_format(&formats), Some(fmt(FrameFormat::GRAY, 640, 360, 30)));
+    }
+
+    #[test]
+    fn detects_a_flashing_emitter() {
+        assert_eq!(strobe_level(&[20.0, 90.0, 21.0, 95.0, 22.0]), Some(95.0));
+        assert_eq!(strobe_level(&[50.0, 50.0, 26.0, 26.0, 26.0]), None);
+        assert_eq!(strobe_level(&[30.0, 40.0, 50.0, 60.0]), None);
+        assert_eq!(strobe_level(&[90.0, 20.0, 90.0]), None);
     }
 
     #[test]

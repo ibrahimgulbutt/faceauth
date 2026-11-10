@@ -104,6 +104,22 @@ privilege-escalation bugs; upgrade, and set up face unlock again afterwards.
 ### Changed
 - **Models come from InsightFace directly** and are the original files, not this project's INT8 conversions (which were only ~25% faster, with unknown accuracy loss). Nothing is rehosted, so no model files need to be published with a FaceAuth release. Old INT8 files are removed on upgrade.
 - Frame 0 is detected and recognised while the camera is still capturing the rest of the sequence.
+- **Infrared cameras work.** IR cameras could never be opened before: the
+  camera library asks V4L2 for the wrong greyscale format code. They are now
+  read directly through V4L2. `camera.device = "ir"` selects one, the installer
+  offers it, `camera.ir_emitter` can switch on an emitter that stays off, and
+  emitters that flash on alternate frames are handled. Profiles record which
+  kind of camera they were made with.
+- **Better in dim light.** Dark frames and faces are brightened before
+  detection and recognition, the camera gets extra frames to adjust its
+  exposure in the dark, and setup accepts dimmer samples.
+- **Camera names** come from the UVC interface, so the colour and IR halves of
+  a combined camera are told apart ("Integrated IR Camera").
+- **Improve stops when nothing matches.** If no sample matches the saved face
+  data for about 10 seconds, setup ends with a clear message instead of
+  waiting forever.
+- `faceauth benchmark` reports the face brightness and warns when an IR
+  camera's light seems to be off.
 - **Face data from before 1.0 is paused, not compared.** It was made with the old INT8 model, so face unlock reports that it needs setting up again (in sudo, `faceauth status` and the app) instead of failing the match and counting toward lockout.
 
 - **Better detection.**

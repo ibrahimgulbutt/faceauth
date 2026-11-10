@@ -80,7 +80,10 @@ impl FaceDetector {
             return Ok(Vec::new());
         }
         let scale = (DET_SIZE as f32 / w as f32).min(DET_SIZE as f32 / h as f32);
-        let input = letterbox(image, scale);
+        // Dark frames (dim room, IR without much light) are brightened first;
+        // the detector finds far more faces that way. Boxes are unaffected.
+        let brightened = brighten_if_dark(image, DARK_FRAME);
+        let input = letterbox(brightened.as_ref().unwrap_or(image), scale);
         let outputs = self.run(input)?;
 
         let mut candidates = Vec::new();
@@ -175,6 +178,28 @@ pub fn align(image: &RgbImage, kpts: &[[f32; 2]; 5]) -> RgbImage {
 }
 
 /// Mean luminance (0–255) inside the face box.
+/// Frames darker than this (mean, 0–255) are brightened before detection.
+const DARK_FRAME: f32 = 60.0;
+/// Mean brightness dark images are lifted towards.
+const BRIGHTEN_TARGET: f32 = 110.0;
+
+/// A gamma-brightened copy when the image's mean brightness is below
+/// `threshold`, else None. Gamma keeps dark detail apart instead of just
+/// scaling noise, and leaves normally lit images untouched.
+pub fn brighten_if_dark(image: &RgbImage, threshold: f32) -> Option<RgbImage> {
+    let mean = crate::camera::mean_brightness(image);
+    if mean >= threshold || mean <= 0.0 {
+        return None;
+    }
+    let gamma = ((BRIGHTEN_TARGET / 255.0).ln() / (mean.max(4.0) / 255.0).ln()).clamp(0.4, 1.0);
+    let lut: Vec<u8> = (0..=255u32).map(|v| (255.0 * (v as f32 / 255.0).powf(gamma)).round() as u8).collect();
+    let mut out = image.clone();
+    for v in out.iter_mut() {
+        *v = lut[*v as usize];
+    }
+    Some(out)
+}
+
 pub fn face_brightness(image: &RgbImage, face: &Face) -> f32 {
     let (w, h) = image.dimensions();
     let x1 = (face.bbox[0].max(0.0) as u32).min(w.saturating_sub(1));
@@ -409,6 +434,16 @@ mod tests {
         let face = |score, size: f32| Face { score, bbox: [0.0, 0.0, size, size], kpts: [[0.0; 2]; 5] };
         let faces = [face(0.9, 80.0), face(0.85, 200.0), face(0.3, 400.0)];
         assert_eq!(primary(&faces).unwrap().width(), 200.0);
+    }
+
+    #[test]
+    fn brightens_only_dark_images() {
+        let dark = RgbImage::from_pixel(64, 64, image::Rgb([30, 30, 30]));
+        let lifted = brighten_if_dark(&dark, 60.0).expect("dark image is brightened");
+        let m = crate::camera::mean_brightness(&lifted);
+        assert!((90.0..130.0).contains(&m), "mean after brightening: {m}");
+        let normal = RgbImage::from_pixel(64, 64, image::Rgb([120, 120, 120]));
+        assert!(brighten_if_dark(&normal, 60.0).is_none());
     }
 
     #[test]

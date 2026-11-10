@@ -153,7 +153,7 @@ fn status() -> Result<ExitCode> {
         }
     } else if s.enrolled {
         println!("{} Face unlock is paused for {}", Style::Warn.paint("!"), Style::Bold.paint(&s.user));
-        println!("  Your face was set up with a different face model. Set it up again:");
+        println!("  Your face was set up with a different camera or face model. Set it up again:");
         println!("  Run: faceauth enroll");
     } else {
         println!("{} Face unlock is not set up for {}", Style::Dim.paint("○"), Style::Bold.paint(&s.user));
@@ -274,7 +274,7 @@ fn list() -> Result<ExitCode> {
         Response::Users(users) => {
             println!("{:<24} {:>7}  UPDATED", "USER", "SAMPLES");
             for u in users {
-                let note = if u.model_current { "" } else { "needs setup again (model changed)" };
+                let note = if u.model_current { "" } else { "needs setup again (camera or model changed)" };
                 println!("{:<24} {:>7}  {:<12} {note}", u.user, u.samples, term::date(u.updated));
             }
         }
@@ -294,9 +294,11 @@ fn cameras() -> Result<ExitCode> {
                 println!("  {:<12} {}", "", Style::Dim.paint(&c.formats.join(", ")));
             }
             println!("\n● = in use. To choose another, set camera.device in /etc/faceauth/config.toml");
-            println!("  (e.g. device = \"/dev/video2\") and run: sudo systemctl restart faceauth");
+            println!("  (\"auto\", \"ir\" or a path such as \"/dev/video2\"), run: sudo systemctl restart faceauth,");
+            println!("  then set up face unlock again (face data from one camera doesn't work with another).");
             if list.iter().any(|c| c.infrared) {
-                println!("  IR cameras often need their emitter enabled: https://github.com/EmixamPP/linux-enable-ir-emitter");
+                println!("\n  An IR camera works in the dark if its IR light turns on. If it stays off, see");
+                println!("  the \"Infrared cameras\" section of the README.");
             }
         }
         other => return Err(unexpected(other)),
@@ -314,6 +316,15 @@ fn benchmark() -> Result<ExitCode> {
             println!("Detection    {:>7.0} ms  (overlaps capture)", b.detection_ms);
             println!("Recognition  {:>7.0} ms  (all frames; frame 1 overlaps capture, logins stop once the vote is decided)", b.recognition_ms);
             println!("Total        {:>7.0} ms", b.total_ms);
+            match b.face_brightness {
+                None => println!("Face         {}", Style::Warn.paint("none in view")),
+                Some(v) if v < 40.0 && b.infrared => println!(
+                    "Face         brightness {v:.0} of 255 — {}",
+                    Style::Warn.paint("too dark: the infrared light seems to be off (see the README)")
+                ),
+                Some(v) if v < 40.0 => println!("Face         brightness {v:.0} of 255 — {}", Style::Warn.paint("dark; face unlock may fail")),
+                Some(v) => println!("Face         brightness {v:.0} of 255"),
+            }
             Ok(ExitCode::SUCCESS)
         }
         other => Err(unexpected(other)),
@@ -350,7 +361,7 @@ fn doctor() -> Result<ExitCode> {
     }
     match fetch_status() {
         Ok(s) if s.enrolled && s.model_current => check(Some(true), "Your face", format!("set up ({} samples)", s.samples)),
-        Ok(s) if s.enrolled => check(Some(false), "Your face", "face model changed — run: faceauth enroll".into()),
+        Ok(s) if s.enrolled => check(Some(false), "Your face", "camera or face model changed — run: faceauth enroll".into()),
         Ok(_) => check(None, "Your face", "not set up — run: faceauth enroll".into()),
         Err(_) => check(None, "Your face", "unknown (service not reachable)".into()),
     }

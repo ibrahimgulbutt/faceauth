@@ -607,7 +607,7 @@ impl Home {
         stack.add_named(&scrolled(&content), Some("ready"));
 
         let banner = adw::Banner::builder()
-            .title("Face unlock needs to be set up again after an update")
+            .title("The camera or face model changed. Set up face unlock again to use it")
             .button_label("Set Up Again")
             .revealed(false)
             .build();
@@ -696,8 +696,10 @@ impl Home {
         }
         *self.used_rows.borrow_mut() = rows;
 
+        // Say "infrared" unless the camera's own name already does.
+        let ir = |c: &str| if s.infrared && !c.contains("IR") { " · infrared" } else { "" };
         self.camera.set_label(&match &s.camera {
-            Some(c) => format!("Camera: {c} · {} recognition", s.recognizer),
+            Some(c) => format!("Camera: {c}{} · {} recognition", ir(c), s.recognizer),
             None => format!("No camera found · {} recognition", s.recognizer),
         });
         self.show("ready");

@@ -58,6 +58,8 @@ Options:
   --no-gui     Don't build or install the Face Unlock app.
   --model=NAME Face recognizer: accurate (ResNet50, ~300 MB download,
                recommended) or fast (MobileFaceNet, ~15 MB). Default: accurate.
+  --camera=KIND  auto (colour camera) or ir (infrared camera). Asked when an
+               IR camera is present; otherwise the current setting is kept.
   -h, --help   Show this help.
 
 Environment:
@@ -72,12 +74,14 @@ EOF
 
 PAM_CHOICE=""
 MODEL_CHOICE=""
+CAMERA_CHOICE=""
 ASSUME_YES=0
 WANT_GUI=1
 for arg in "$@"; do
     case "$arg" in
         --pam=*)  PAM_CHOICE="${arg#--pam=}" ;;
         --model=*) MODEL_CHOICE="${arg#--model=}" ;;
+        --camera=*) CAMERA_CHOICE="${arg#--camera=}" ;;
         --yes|-y) ASSUME_YES=1 ;;
         --no-gui) WANT_GUI=0 ;;
         -h|--help) usage; exit 0 ;;
@@ -139,6 +143,40 @@ fi
 case "$MODEL_CHOICE" in
     accurate|fast) ok "Recognizer: $MODEL_CHOICE" ;;
     *) die "Unknown --model '$MODEL_CHOICE' (use accurate or fast)." ;;
+esac
+
+# Infrared camera: the UVC interface name says "IR Camera" even when the
+# device name doesn't (combined RGB + IR modules).
+IR_CAMERA=""
+for node in /sys/class/video4linux/video*; do
+    [ -e "$node" ] || continue
+    for f in "$node/device/interface" "$node/name"; do
+        if [ -r "$f" ] && grep -qiE '(^|[^[:alnum:]])(ir|infrared)([^[:alnum:]]|$)' "$f"; then
+            IR_CAMERA="$(tr -d '\n' <"$f")"
+            break 2
+        fi
+    done
+done
+CURRENT_CAMERA=$(sed -n '/^[[:space:]]*\[camera\]/,/^[[:space:]]*\[/s/^[[:space:]]*device[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' \
+    /etc/faceauth/config.toml 2>/dev/null | head -n1)
+if [ -z "$CAMERA_CHOICE" ] && [ -n "$IR_CAMERA" ]; then
+    default=1
+    [ "$CURRENT_CAMERA" = "ir" ] && default=2
+    printf '\n    This computer has an infrared camera (%s).\n' "$IR_CAMERA"
+    printf '    It works in the dark and is harder to fool with a photo, but only when its\n'
+    printf '    infrared light turns on. On many laptops that needs linux-enable-ir-emitter\n'
+    printf '    first (see "Infrared cameras" in the README).\n'
+    printf '      1) Colour camera    works right away, needs some light\n'
+    printf '      2) Infrared camera  works in the dark once its light is on\n'
+    case "$(ask "    Choose [$default]: " "$default")" in
+        2|ir) CAMERA_CHOICE=ir ;;
+        *) CAMERA_CHOICE=auto ;;
+    esac
+fi
+case "$CAMERA_CHOICE" in
+    "") ;;
+    auto|ir) ok "Camera: $([ "$CAMERA_CHOICE" = ir ] && echo infrared || echo colour)" ;;
+    *) die "Unknown --camera '$CAMERA_CHOICE' (use auto or ir)." ;;
 esac
 
 info "Asking for your password once so later steps can use sudo..."
@@ -381,31 +419,35 @@ else
     ok "Created $CONFIG_DIR/config.toml"
 fi
 
-# Record the chosen recognizer in [recognition] (adding the key or section if needed).
-set_recognition_model() {
-    # Replace an existing [recognition] model line in place (keeping its
-    # comments), else add one right under the [recognition] header, else add
-    # the section. Two passes over a copy: the first only looks for the line.
+# set_config SECTION KEY VALUE — set a string value in config.toml. Replaces an
+# existing line in place (keeping its comments), else adds it right under the
+# section header, else adds the section. Two passes over a copy: the first only
+# looks for the line.
+set_config() {
     local cfg="$CONFIG_DIR/config.toml" orig tmp
     orig=$(mktemp) tmp=$(mktemp)
     sudo cat "$cfg" >"$orig"
-    awk -v line="model = \"$1\"" '
+    awk -v sec="$1" -v key="$2" -v line="$2 = \"$3\"" '
         function is_header(l) { return l ~ /^[[:space:]]*\[/ }
-        function is_rec(l) { return l ~ /^[[:space:]]*\[recognition\][[:space:]]*(#.*)?$/ }
-        function is_model(l) { return l ~ /^[[:space:]]*model[[:space:]]*=/ }
-        NR == FNR { if (is_header($0)) in_rec = is_rec($0); else if (in_rec && is_model($0)) has = 1; next }
-        FNR == 1 { in_rec = 0 }
-        is_header($0) { in_rec = is_rec($0) }
-        in_rec && is_model($0) { if (!done) { print line; done = 1 }; next }
+        function is_sec(l) { return l ~ ("^[[:space:]]*\\[" sec "\\][[:space:]]*(#.*)?$") }
+        function is_key(l) { return l ~ ("^[[:space:]]*" key "[[:space:]]*=") }
+        NR == FNR { if (is_header($0)) in_sec = is_sec($0); else if (in_sec && is_key($0)) has = 1; next }
+        FNR == 1 { in_sec = 0 }
+        is_header($0) { in_sec = is_sec($0) }
+        in_sec && is_key($0) { if (!done) { print line; done = 1 }; next }
         { print }
-        in_rec && is_rec($0) && !has && !done { print line; done = 1 }
-        END { if (!done) { print ""; print "[recognition]"; print line } }
+        in_sec && is_sec($0) && !has && !done { print line; done = 1 }
+        END { if (!done) { print ""; print "[" sec "]"; print line } }
     ' "$orig" "$orig" >"$tmp"
     sudo install -m 644 "$tmp" "$cfg"
     rm -f "$orig" "$tmp"
 }
-set_recognition_model "$MODEL_CHOICE"
+set_config recognition model "$MODEL_CHOICE"
 ok "Recognizer set to '$MODEL_CHOICE' (changing it later means setting up face unlock again)"
+if [ -n "$CAMERA_CHOICE" ] && [ "$CAMERA_CHOICE" != "${CURRENT_CAMERA:-auto}" ]; then
+    set_config camera device "$CAMERA_CHOICE"
+    ok "Camera set to '$CAMERA_CHOICE' (face data made with the other camera has to be set up again)"
+fi
 
 # Versions before 1.0 kept face data in root's home directory.
 if sudo test -f "$OLD_STATE_DIR/master.key"; then

@@ -1,7 +1,7 @@
 //! Face verification and the benchmark. Everything here blocks and expects
 //! the caller to hold the camera lock.
 
-use crate::camera::CameraManager;
+use crate::camera::{mean_brightness, CameraManager};
 use crate::config::Config;
 use crate::detection::{self, FaceDetector};
 use crate::liveness;
@@ -15,6 +15,8 @@ pub struct Pipeline<'a> {
     pub config: &'a Config,
     pub detector: &'a FaceDetector,
     pub engine: &'a FaceEngine,
+    /// The camera is infrared.
+    pub infrared: bool,
 }
 
 pub struct Verdict {
@@ -103,7 +105,17 @@ pub fn verify(camera: &CameraManager, p: &Pipeline, enrolled: &[Vec<f32>]) -> Ve
 pub fn benchmark(camera: &CameraManager, p: &Pipeline) -> anyhow::Result<BenchmarkReport> {
     let total = Instant::now();
     let captured = capture(camera, p)?;
-    let face = detection::primary(&captured.faces_first).map(|f| f.kpts);
+    let primary = detection::primary(&captured.faces_first);
+    match primary {
+        Some(f) => info!(
+            "Benchmark: face {:.0} px wide, brightness {:.0}, detector score {:.2}",
+            f.width(),
+            detection::face_brightness(&captured.frames[0], f),
+            f.score
+        ),
+        None => info!("Benchmark: no face in view"),
+    }
+    let face = primary.map(|f| f.kpts);
     let rec_start = Instant::now();
     if let Some(kpts) = face {
         // Frame 0 was recognised during capture; time the rest here.
@@ -121,6 +133,8 @@ pub fn benchmark(camera: &CameraManager, p: &Pipeline) -> anyhow::Result<Benchma
         detection_ms: captured.detection_ms,
         recognition_ms,
         total_ms: ms(total),
+        face_brightness: primary.map(|f| detection::face_brightness(&captured.frames[0], f)),
+        infrared: p.infrared,
     })
 }
 
@@ -172,16 +186,6 @@ fn capture(camera: &CameraManager, p: &Pipeline) -> anyhow::Result<Captured> {
     // vote stricter.
     frames.extend(rest.unwrap_or_default());
     Ok(Captured { frames, faces_first, first_embedding, capture_ms, detection_ms, first_embed_ms })
-}
-
-fn mean_brightness(img: &RgbImage) -> f32 {
-    let raw = img.as_raw();
-    if raw.is_empty() {
-        return 0.0;
-    }
-    // Sampling every 7th byte is plenty for a mean.
-    let (sum, n) = raw.iter().step_by(7).fold((0u64, 0u64), |(s, n), &v| (s + v as u64, n + 1));
-    sum as f32 / n as f32
 }
 
 fn ms(t: Instant) -> f32 {

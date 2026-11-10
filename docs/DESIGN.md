@@ -139,7 +139,7 @@ client                         daemon
   1. exactly one face (`MultipleFaces`); a second face at least ¼ the size of
      the largest counts;
   2. face at least `min_face_size` px wide (`MoveCloser`);
-  3. face brightness within 45–215 (`TooDark` / `TooBright`);
+  3. face brightness within 28–215 (`TooDark`, or `IrLightOff` on an IR camera / `TooBright`);
   4. head pose matches the step (`TurnMore` / `TooFar`), relaxed after 6 s on a
      step so nobody gets stuck;
   5. same person: similarity ≥ 0.40 to the samples already collected (or, in
@@ -216,12 +216,20 @@ and the extracted file against SHA-256 values in `dist/fetch-models.sh`.
 ## Camera
 
 `camera.device = "auto"` picks the first V4L2 device offering a colour format
-(MJPEG, YUYV, NV12). A path (`/dev/video2`, `/dev/v4l/by-id/...`) selects a
-device explicitly; that is how IR cameras are used. Format preference: MJPEG
-closest to 1280×720 → YUYV closest to 640×480 → GREY closest to 640×480 →
-anything else. GREY (IR) frames are expanded to RGB before detection.
-`faceauth cameras` lists devices and marks likely IR cameras. IR emitters often
-need [linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter).
+(MJPEG, YUYV, NV12); `"ir"` picks the first infrared one. A path
+(`/dev/video2`, `/dev/v4l/by-id/...`) selects a device explicitly. Format
+preference: MJPEG closest to 1280×720 → YUYV closest to 640×480 → GREY closest
+to 640×480 → anything else. GREY (IR) frames are read with `v4l` and expanded
+to RGB before detection.
+
+Profiles record whether they were made with an IR camera; a profile from the
+other kind of camera is `ModelChanged` (set up again). The installer offers
+the IR camera when it finds one. IR emitters often need
+[linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter);
+`camera.ir_emitter` re-sends its control each time the stream starts, and
+emitters flashing on alternate frames are handled by skipping dark frames.
+`faceauth benchmark` reports face brightness, which shows whether the emitter
+is on.
 
 ## Install, upgrade, uninstall
 

@@ -22,6 +22,10 @@ pub struct UserProfile {
     /// longer ships, so they never match and have to be set up again.
     #[serde(default)]
     pub model_id: Option<String>,
+    /// Made with an infrared camera. IR and colour images give embeddings
+    /// that can't be compared.
+    #[serde(default)]
+    pub infrared: bool,
     #[serde(default)]
     pub created: u64,
     #[serde(default, alias = "last_updated")]
@@ -29,8 +33,10 @@ pub struct UserProfile {
 }
 
 impl UserProfile {
-    pub fn model_matches(&self, current: &str) -> bool {
-        self.model_id.as_deref() == Some(current)
+    /// Whether this profile can be compared with what the daemon produces now:
+    /// same recognizer file, same kind of camera.
+    pub fn usable_with(&self, model_id: &str, infrared: bool) -> bool {
+        self.model_id.as_deref() == Some(model_id) && self.infrared == infrared
     }
 }
 
@@ -182,7 +188,7 @@ mod tests {
     fn round_trip_and_delete() {
         let dir = temp_dir("roundtrip");
         let store = SecureStorage::new(dir.clone()).unwrap();
-        let profile = UserProfile { user: "alice".into(), embeddings: vec![vec![0.6, 0.8]], model_id: Some("abc".into()), created: 1, updated: 2 };
+        let profile = UserProfile { user: "alice".into(), embeddings: vec![vec![0.6, 0.8]], model_id: Some("abc".into()), infrared: false, created: 1, updated: 2 };
         store.save_user(&profile).unwrap();
         let back = store.load_user("alice").unwrap().unwrap();
         assert_eq!(back.embeddings, profile.embeddings);
@@ -210,6 +216,14 @@ mod tests {
         let legacy = r#"{"user":"bob","name":"bob","embeddings":[[1.0]],"last_updated":42}"#;
         let p: UserProfile = serde_json::from_str(legacy).unwrap();
         assert_eq!(p.updated, 42);
-        assert!(!p.model_matches("anything"), "pre-1.0 profiles must be set up again");
+        assert!(!p.usable_with("anything", false), "pre-1.0 profiles must be set up again");
+    }
+
+    #[test]
+    fn camera_kind_must_match() {
+        let p: UserProfile = serde_json::from_str(r#"{"user":"a","embeddings":[[1.0]],"model_id":"m"}"#).unwrap();
+        assert!(p.usable_with("m", false));
+        assert!(!p.usable_with("m", true), "colour face data can't be used with an IR camera");
+        assert!(!p.usable_with("other", false));
     }
 }

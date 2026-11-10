@@ -31,7 +31,8 @@ pub fn status() -> Result<UserStatus, String> {
         created: if enrolled { three_days_ago } else { 0 },
         updated: if enrolled { three_days_ago } else { 0 },
         model_current: m != "outdated",
-        camera: Some("Integrated RGB Camera (/dev/video0)".into()),
+        camera: Some("Integrated Camera (/dev/video0)".into()),
+        infrared: false,
         recognizer: "Accurate (ResNet50)".into(),
     })
 }

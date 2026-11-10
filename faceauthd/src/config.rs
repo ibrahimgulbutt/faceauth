@@ -22,17 +22,31 @@ pub struct Config {
 #[derive(Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct CameraConfig {
-    /// `"auto"`, or a device path such as `/dev/video2` or `/dev/v4l/by-id/...`.
+    /// `"auto"` (first colour camera), `"ir"` (first infrared camera), or a
+    /// device path such as `/dev/video2` or `/dev/v4l/by-id/...`.
     pub device: String,
     pub warmup_frames: usize,
     pub sequence_length: usize,
     pub sequence_interval_ms: u64,
+    /// Vendor command that switches on an IR camera's emitter, sent each time
+    /// the stream starts. Only needed when the IR light stays off.
+    pub ir_emitter: Option<IrEmitter>,
 }
 
 impl Default for CameraConfig {
     fn default() -> Self {
-        Self { device: "auto".into(), warmup_frames: 8, sequence_length: 5, sequence_interval_ms: 40 }
+        Self { device: "auto".into(), warmup_frames: 8, sequence_length: 5, sequence_interval_ms: 40, ir_emitter: None }
     }
+}
+
+/// A UVC extension-unit control: `unit`, `selector` and the bytes to set, as
+/// reported by linux-enable-ir-emitter.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct IrEmitter {
+    pub unit: u8,
+    pub selector: u8,
+    pub control: Vec<u8>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -179,6 +193,11 @@ impl Config {
         if self.camera.warmup_frames > 60 {
             anyhow::bail!("camera.warmup_frames must be at most 60");
         }
+        if let Some(e) = &self.camera.ir_emitter {
+            if e.control.is_empty() || e.control.len() > 64 {
+                anyhow::bail!("camera.ir_emitter.control must have 1 to 64 bytes");
+            }
+        }
         if self.recognition.threads > 16 {
             anyhow::bail!("recognition.threads must be between 0 (automatic) and 16");
         }
@@ -237,6 +256,19 @@ mod tests {
         assert_eq!(cfg.recognition.effective_threads(), 1);
         assert_eq!(Config::default().recognition.model, RecognitionModel::Accurate);
         assert!(toml::from_str::<Config>("[recognition]\nmodel = \"huge\"\n").is_err());
+    }
+
+    #[test]
+    fn parses_ir_settings() {
+        let cfg: Config = toml::from_str(
+            "[camera]\ndevice = \"ir\"\n[camera.ir_emitter]\nunit = 14\nselector = 6\ncontrol = [1, 3, 3, 0, 0, 0, 0, 0, 0]\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let e = cfg.camera.ir_emitter.unwrap();
+        assert_eq!((e.unit, e.selector, e.control.len()), (14, 6, 9));
+        let empty: Config = toml::from_str("[camera.ir_emitter]\nunit = 1\nselector = 1\ncontrol = []\n").unwrap();
+        assert!(empty.validate().is_err());
     }
 
     #[test]
