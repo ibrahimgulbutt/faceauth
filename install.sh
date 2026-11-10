@@ -125,17 +125,74 @@ OS_ID="${ID:-unknown}"
 OS_LIKE="${ID_LIKE:-}"
 info "${PRETTY_NAME:-$OS_ID} · $(uname -m) · kernel $(uname -r)"
 
+# ── Already installed? ──
+# The version this run installs: the checkout's own, or the release tag.
+workspace_version() { awk -F'"' '/^\[workspace.package\]/{s=1} s && /^version/{print $2; exit}' "$1" 2>/dev/null; }
+is_version() { [[ "$1" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; }
+TARGET_VERSION=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    TARGET_VERSION=$(workspace_version "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/Cargo.toml")
+fi
+TARGET_VERSION="${TARGET_VERSION:-${FACEAUTH_REF#v}}"
+
+INSTALLED_VERSION=""
+if [ -x "$PREFIX/bin/faceauth" ] || [ -x "$PREFIX/bin/faceauthd" ] || [ -f /etc/systemd/system/faceauth.service ]; then
+    INSTALLED_VERSION=$("$PREFIX/bin/faceauth" --version 2>/dev/null | awk '{print $2}')
+    is_version "$INSTALLED_VERSION" || INSTALLED_VERSION="old"   # versions before 1.0 can't tell
+fi
+# version_lt A B — A is older than B
+version_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]; }
+
+INSTALL_KIND=install
+if [ -z "$INSTALLED_VERSION" ]; then
+    ok "Installing FaceAuth $TARGET_VERSION"
+elif [ "$INSTALLED_VERSION" = "old" ]; then
+    INSTALL_KIND=upgrade
+    ok "An older FaceAuth (before 1.0) is installed. Upgrading it to $TARGET_VERSION."
+    info "Your settings and face data are moved over. You'll set up face unlock once more"
+    info "afterwards, because the face model changed."
+elif ! is_version "$TARGET_VERSION"; then
+    INSTALL_KIND=upgrade
+    ok "FaceAuth $INSTALLED_VERSION is installed. Installing $FACEAUTH_REF over it (settings and face data are kept)."
+elif [ "$INSTALLED_VERSION" = "$TARGET_VERSION" ]; then
+    INSTALL_KIND=repair
+    ok "FaceAuth $INSTALLED_VERSION is already installed."
+    info "Running the installer again repairs it and lets you change the camera, face model"
+    info "or where face unlock is used. Your settings and face data are kept."
+    case "$(ask '    Continue? [Y/n] ' y)" in
+        [Nn]*) info "Nothing was changed."; exit 0 ;;
+    esac
+elif version_lt "$INSTALLED_VERSION" "$TARGET_VERSION"; then
+    INSTALL_KIND=upgrade
+    ok "FaceAuth $INSTALLED_VERSION is installed. Upgrading to $TARGET_VERSION (settings and face data are kept)."
+else
+    warn "FaceAuth $INSTALLED_VERSION is installed, which is newer than this installer ($TARGET_VERSION)."
+    case "$(ask "    Replace it with the older $TARGET_VERSION? [y/N] " n)" in
+        [Yy]*) INSTALL_KIND=downgrade ;;
+        *) info "Nothing was changed."; exit 0 ;;
+    esac
+fi
+
 if compgen -G "/dev/video*" >/dev/null; then
     ok "Camera device found"
 else
     warn "No camera found (/dev/video*). You can install now and connect one later."
 fi
 
+# config_value SECTION KEY — a string value from the installed config, if any.
+config_value() {
+    sed -n "/^[[:space:]]*\\[$1\\]/,/^[[:space:]]*\\[/s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\\(.*\\)\".*/\\1/p" \
+        /etc/faceauth/config.toml 2>/dev/null | head -n1
+}
+CURRENT_MODEL=$(config_value recognition model)
 if [ -z "$MODEL_CHOICE" ]; then
+    default=1
+    [ "$CURRENT_MODEL" = "fast" ] && default=2
     printf '\n    Which face recognizer should FaceAuth use?\n'
     printf '      1) Accurate  ResNet50, much better at telling similar faces apart (~300 MB download) [recommended]\n'
     printf '      2) Fast      MobileFaceNet, smaller and quicker (~15 MB download)\n'
-    case "$(ask '    Choose [1]: ' 1)" in
+    [ -n "$CURRENT_MODEL" ] && printf '      (currently: %s; changing it means setting up face unlock again)\n' "$CURRENT_MODEL"
+    case "$(ask "    Choose [$default]: " "$default")" in
         2|fast) MODEL_CHOICE=fast ;;
         *) MODEL_CHOICE=accurate ;;
     esac
@@ -157,8 +214,7 @@ for node in /sys/class/video4linux/video*; do
         fi
     done
 done
-CURRENT_CAMERA=$(sed -n '/^[[:space:]]*\[camera\]/,/^[[:space:]]*\[/s/^[[:space:]]*device[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' \
-    /etc/faceauth/config.toml 2>/dev/null | head -n1)
+CURRENT_CAMERA=$(config_value camera device)
 if [ -z "$CAMERA_CHOICE" ] && [ -n "$IR_CAMERA" ]; then
     default=1
     [ "$CURRENT_CAMERA" = "ir" ] && default=2
@@ -521,6 +577,125 @@ else
     info "Check it later with: faceauth doctor"
 fi
 
+# ── Infrared light ───────────────────────────────────────────────────────────
+#
+# An IR camera only sees in the dark when its infrared light (emitter) is on.
+# On many laptops Linux doesn't switch it on. linux-enable-ir-emitter (MIT,
+# github.com/EmixamPP/linux-enable-ir-emitter) finds the vendor command by
+# trying the camera's settings while the user confirms; FaceAuth then sends
+# that command itself. The tool is downloaded (pinned, checksummed) and run
+# here so users don't have to set anything up separately.
+
+IR_TOOL=linux-enable-ir-emitter
+IR_TOOL_VERSION=7.0.0
+declare -A IR_TOOL_SHA256=(
+    [x86_64]="b5ea03b8a058b4d028d7c54dbd307b4bac2159a32cd2999da06cadc692907375"
+    [aarch64]="c37e3da272f780ac0fd82de3c99e2aac9b914a66f03a2e5fd4cd58ee78978375"
+)
+
+# Face brightness (0–255) seen by the IR camera, or nothing if no face.
+ir_face_brightness() {
+    env -u FACEAUTH_SOCKET "$PREFIX/bin/faceauth" benchmark 2>/dev/null \
+        | sed -n 's/^Face[[:space:]]*brightness \([0-9][0-9]*\).*/\1/p'
+}
+
+restart_service() {
+    sudo systemctl restart faceauth.service
+    for _ in $(seq 1 15); do
+        env -u FACEAUTH_SOCKET "$PREFIX/bin/faceauth" ping >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    return 1
+}
+
+install_ir_tool() {
+    if command -v "$IR_TOOL" >/dev/null 2>&1 && "$IR_TOOL" --version 2>/dev/null | grep -Eq " 7\."; then
+        return 0
+    fi
+    local arch sha asset dir
+    arch=$(uname -m)
+    sha="${IR_TOOL_SHA256[$arch]:-}"
+    [ -n "$sha" ] || { warn "No $IR_TOOL download for $arch."; return 1; }
+    asset="$IR_TOOL-$IR_TOOL_VERSION-release-${arch/_/-}.tar.gz"
+    dir=$(mktemp -d)
+    info "Downloading $IR_TOOL $IR_TOOL_VERSION..."
+    if ! curl -fsSL --proto '=https' --retry 3 -o "$dir/$asset" \
+        "https://github.com/EmixamPP/$IR_TOOL/releases/download/$IR_TOOL_VERSION/$asset"; then
+        rm -rf "$dir"; warn "Download failed."; return 1
+    fi
+    if ! echo "$sha  $dir/$asset" | sha256sum -c --status; then
+        rm -rf "$dir"; warn "Checksum mismatch for $asset; not using it."; return 1
+    fi
+    sudo tar -C /usr/local/bin --no-same-owner -m -xzf "$dir/$asset" "$IR_TOOL"
+    rm -rf "$dir"
+    ok "Installed $IR_TOOL $IR_TOOL_VERSION"
+}
+
+use_colour_camera() {
+    set_config camera device auto
+    restart_service || true
+    ok "Using the colour camera. Re-run this installer any time to try the IR camera again."
+}
+
+if [ "$SERVICE_OK" -eq 1 ] && [ "${CAMERA_CHOICE:-${CURRENT_CAMERA:-auto}}" = "ir" ]; then
+    step "Checking the infrared light"
+    if [ "$ASSUME_YES" -eq 1 ] || [ "$HAVE_TTY" -eq 0 ]; then
+        info "Skipped (not interactive). Check later with: faceauth benchmark"
+    else
+        ask "    Look at the camera, then press Enter: " "" >/dev/null
+        IR_LEVEL=$(ir_face_brightness)
+        if [ -n "$IR_LEVEL" ] && [ "$IR_LEVEL" -ge 40 ]; then
+            ok "The infrared light works (face brightness $IR_LEVEL)"
+        else
+            if [ -n "$IR_LEVEL" ]; then
+                info "Face brightness is only $IR_LEVEL: the camera's infrared light is off,"
+            else
+                info "The IR camera couldn't see your face: its infrared light is probably off,"
+            fi
+            info "so face unlock won't work in the dark yet. FaceAuth can switch it on with"
+            info "$IR_TOOL (free, open source). It tries the camera's settings while you"
+            info "answer a few yes/no questions, and takes a few minutes. Rarely, a camera"
+            info "needs to be powered off and on again afterwards."
+            case "$(ask '    Switch on the infrared light now? [Y/n] ' y)" in
+                [Nn]*)
+                    use_colour_camera ;;
+                *)
+                    if install_ir_tool; then
+                        printf '\n'
+                        info "${BOLD}In the next screen:${NC}"
+                        info "  1. Choose ${BOLD}IR Enabler${NC} (arrow keys, then Enter)"
+                        info "  2. Choose ${BOLD}Continue${NC}, read the warning and accept it"
+                        info "  3. Sit close to the camera. When asked whether the light is on,"
+                        info "     press Y or N (the preview flashes when it is on)"
+                        info "  It finishes by itself. Press q to give up."
+                        ask "    Press Enter to start: " "" >/dev/null
+                        "$IR_TOOL" configure </dev/tty >/dev/tty 2>&1 || warn "$IR_TOOL exited with an error."
+                        printf '\n'
+                        if EMITTER_TOML=$("$PREFIX/bin/faceauth" ir-emitter --toml 2>/dev/null) && [ -n "$EMITTER_TOML" ]; then
+                            set_ir_emitter "$EMITTER_TOML"
+                            restart_service || true
+                            ask "    Found it. Look at the camera, then press Enter: " "" >/dev/null
+                            IR_LEVEL=$(ir_face_brightness)
+                            if [ -n "$IR_LEVEL" ] && [ "$IR_LEVEL" -ge 40 ]; then
+                                ok "The infrared light works now (face brightness $IR_LEVEL)"
+                            else
+                                warn "The light still looks off (face brightness ${IR_LEVEL:-none})."
+                                use_colour_camera
+                            fi
+                        else
+                            warn "No setting that switches the light on was saved."
+                            info "You can retry later with: $IR_TOOL configure (then re-run this installer)"
+                            use_colour_camera
+                        fi
+                    else
+                        use_colour_camera
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+fi
+
 # ── PAM ──────────────────────────────────────────────────────────────────────
 
 LOGIN_SERVICES=(gdm-password sddm lightdm)
@@ -705,7 +880,12 @@ for f in /etc/pam.d/*; do
     fi
 done
 
-printf '\n%sFaceAuth %s is installed.%s\n\n' "$GREEN$BOLD" "$VERSION" "$NC"
+case "$INSTALL_KIND" in
+    upgrade|downgrade) DONE_MSG="FaceAuth ${INSTALLED_VERSION/old/(before 1.0)} → $VERSION: done." ;;
+    repair) DONE_MSG="FaceAuth $VERSION is repaired and up to date." ;;
+    *) DONE_MSG="FaceAuth $VERSION is installed." ;;
+esac
+printf '\n%s%s%s\n\n' "$GREEN$BOLD" "$DONE_MSG" "$NC"
 if [ -n "$ENABLED" ]; then
     info "Face unlock is enabled for: ${ENABLED% }"
 else

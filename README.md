@@ -63,10 +63,20 @@ The installer:
    module, polkit policy and app;
 3. downloads the face models from InsightFace's official releases and verifies their SHA-256 checksums;
 4. starts the service;
-5. asks where to use face unlock.
+5. if you chose an infrared camera, checks that its light works and, if it
+   doesn't, offers to switch it on for you (see [Infrared cameras](#infrared-cameras));
+6. asks where to use face unlock.
 
-Non-interactive options: `--pam=sudo,login,lock,polkit`, `--yes`, `--no-gui`
-(see `./install.sh --help`).
+That one command is all you need; nothing has to be downloaded or set up
+separately.
+
+**Running it again** is safe. It tells you what it will do first: install,
+upgrade ("FaceAuth 1.0.0 is installed. Upgrading to 1.1.0"), or, on the same
+version, repair and let you change settings. Your settings and face data are
+kept, and your current choices are the defaults.
+
+Non-interactive options: `--pam=sudo,login,lock,polkit`, `--model=accurate|fast`,
+`--camera=auto|ir`, `--yes`, `--no-gui` (see `./install.sh --help`).
 
 ## Getting started
 
@@ -256,7 +266,14 @@ emitter stays off and the IR picture is nearly black. To check, run
 camera while it runs: phone cameras show the emitter as a flickering purple
 light.
 
-If it's off, [linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter)
+**The installer handles this.** When you choose the infrared camera it looks
+through the camera, and if the light is off it offers to switch it on: it
+downloads [linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter)
+(MIT licensed, checksum-verified), runs it with short on-screen instructions,
+saves what it finds and checks again. If the light can't be switched on, it
+goes back to the colour camera so face unlock still works.
+
+Doing it by hand instead: linux-enable-ir-emitter
 can find the vendor command for your camera. It's used by many people for
 exactly this, works with most UVC infrared cameras, and asks you to confirm
 before saving anything (a wrong value can make the camera misbehave until a
