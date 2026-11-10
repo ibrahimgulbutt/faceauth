@@ -120,14 +120,13 @@ privilege-escalation bugs; upgrade, and set up face unlock again afterwards.
   waiting forever.
 - `faceauth benchmark` reports the face brightness and warns when an IR
   camera's light seems to be off.
-- **One command does everything.** When the infrared camera is chosen, the
-  installer checks the IR light through the camera; if it's off, it offers to
-  download linux-enable-ir-emitter 7.0.0 (pinned, SHA-256 verified), guides
+- **One command does everything.** An infrared camera is used automatically
+  when present. The installer checks the IR light through the camera; if it's
+  off, it downloads linux-enable-ir-emitter 7.0.0 (pinned, SHA-256 verified), guides
   the user through it, imports the result, checks again, and falls back to the
   colour camera if the light can't be switched on.
 - **Re-running the installer says what it will do:** install, upgrade
-  ("FaceAuth A is installed. Upgrading to B"), repair the same version (after
-  asking), or refuse a silent downgrade. Current settings are the defaults, and
+  ("FaceAuth A is installed. Upgrading to B"), repair the same version, or refuse a silent downgrade. Current settings are the defaults, and
   the summary says what happened.
 - **IR light settings are imported.** When the infrared camera is chosen, the
   installer reads what linux-enable-ir-emitter (v7) saved for that camera and
