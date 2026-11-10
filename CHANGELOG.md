@@ -120,8 +120,9 @@ privilege-escalation bugs; upgrade, and set up face unlock again afterwards.
   waiting forever.
 - `faceauth benchmark` reports the face brightness and warns when an IR
   camera's light seems to be off.
-- **One command does everything.** An infrared camera is used automatically
-  when present. The installer checks the IR light through the camera; if it's
+- **Step-by-step install guide with screenshots** (`docs/INSTALL_GUIDE.md`).
+- **One command does everything.** An infrared camera is offered (and is the
+  default answer) when present. The installer checks the IR light through the camera; if it's
   off, it downloads linux-enable-ir-emitter 7.0.0 (pinned, SHA-256 verified), guides
   the user through it, imports the result, checks again, and falls back to the
   colour camera if the light can't be switched on.

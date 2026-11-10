@@ -58,8 +58,8 @@ Options:
   --no-gui     Don't build or install the Face Unlock app.
   --model=NAME Face recognizer: accurate (ResNet50, ~300 MB download,
                recommended) or fast (MobileFaceNet, ~15 MB). Default: accurate.
-  --camera=KIND  ir (infrared camera; chosen automatically when one exists)
-               or auto (colour camera).
+  --camera=KIND  ir (infrared camera) or auto (normal colour camera).
+               Asked when an IR camera is present; IR is the default.
   -h, --help   Show this help.
 
 Environment:
@@ -215,8 +215,16 @@ CURRENT_CAMERA=$(config_value camera device)
 # (--camera=auto keeps the colour camera.) If its light can't be switched on,
 # the colour camera is used after all; see "Checking the infrared light".
 if [ -z "$CAMERA_CHOICE" ] && [ -n "$IR_CAMERA" ]; then
-    CAMERA_CHOICE=ir
-    info "Found an infrared camera ($IR_CAMERA); using it, since it works in the dark."
+    default=1
+    [ "$CURRENT_CAMERA" = "auto" ] && default=2
+    printf '\n    This computer has an infrared camera (%s). Which camera should FaceAuth use?\n' "$IR_CAMERA"
+    printf '      1) Infrared camera  works in the dark, harder to fool [recommended]\n'
+    printf '         (if its light is off, the installer helps you switch it on)\n'
+    printf '      2) Normal camera    works right away, needs some light\n'
+    case "$(ask "    Choose [$default]: " "$default")" in
+        2|auto|normal|colour) CAMERA_CHOICE=auto ;;
+        *) CAMERA_CHOICE=ir ;;
+    esac
 fi
 case "$CAMERA_CHOICE" in
     "") ;;
@@ -520,10 +528,6 @@ if [ "${CAMERA_CHOICE:-${CURRENT_CAMERA:-auto}}" = "ir" ]; then
         ok "IR light: using the settings saved by linux-enable-ir-emitter"
     elif sudo grep -Eq '^[[:space:]]*\[\[?[[:space:]]*camera\.ir_emitter' "$CONFIG_DIR/config.toml"; then
         ok "IR light: keeping the settings already in $CONFIG_DIR/config.toml"
-    else
-        info "IR light: if face unlock fails in the dark, the camera's infrared light is off."
-        info "  Run 'linux-enable-ir-emitter configure' as yourself, then re-run this installer."
-        info "  Details: faceauth ir-emitter, and \"Infrared cameras\" in the README."
     fi
 fi
 
@@ -621,6 +625,7 @@ install_ir_tool() {
 }
 
 use_colour_camera() {
+    CAMERA_CHOICE=auto
     set_config camera device auto
     restart_service || true
     ok "Using the colour camera. Re-run this installer any time to try the IR camera again."
@@ -632,13 +637,18 @@ setup_ir_light() {
     [ "$HAVE_TTY" -eq 1 ] || { info "Switching the light on needs a terminal."; return 1; }
     install_ir_tool || return 1
     printf '\n'
-    info "${BOLD}Switching on the infrared light. In the next screen:${NC}"
-    info "  1. Choose ${BOLD}IR Enabler${NC} (arrow keys, then Enter)"
-    info "  2. Choose ${BOLD}Continue${NC}, read the warning and accept it"
-    info "  3. Sit close to the camera. When asked whether the light is on,"
-    info "     press Y or N (the preview flashes when it is on)"
-    info "  It finishes by itself. Press q to give up."
-    sleep 3
+    info "${BOLD}Switching on the infrared light.${NC} A helper opens next. In it:"
+    info "  1. ${BOLD}IR Enabler${NC} is selected: press Enter."
+    info "  2. Leave the settings as they are: press Enter."
+    info "  3. \"Do you want to start?\": press Y."
+    info "  4. Sit in front of the camera and keep still. It asks"
+    info "     \"Is the camera emitter or preview blinking?\""
+    info "     ${BOLD}The first time it asks, nothing has been changed yet: press N.${NC}"
+    info "     After that, press Y only if the preview suddenly gets bright or"
+    info "     flickers (a phone camera shows the light as a purple flicker); else N."
+    info "  It can take a few minutes and closes by itself. Don't close the window;"
+    info "  to give up, press Esc. Guide with pictures: docs/INSTALL_GUIDE.md"
+    ask "    Press Enter to start: " "" >/dev/null
     "$IR_TOOL" configure </dev/tty >/dev/tty 2>&1 || warn "$IR_TOOL exited with an error."
     printf '\n'
     local toml level
@@ -648,8 +658,7 @@ setup_ir_light() {
     fi
     set_ir_emitter "$toml"
     restart_service || true
-    info "Checking again. Look at the camera for a moment..."
-    sleep 1
+    ask "    Checking the light. Look at the camera, then press Enter: " "" >/dev/null
     level=$(ir_face_brightness)
     if [ -n "$level" ] && [ "$level" -ge 40 ]; then
         ok "The infrared light works now (face brightness $level)"
@@ -661,8 +670,11 @@ setup_ir_light() {
 
 if [ "$SERVICE_OK" -eq 1 ] && [ "${CAMERA_CHOICE:-${CURRENT_CAMERA:-auto}}" = "ir" ]; then
     step "Checking the infrared light"
-    info "Look at the camera for a moment..."
-    sleep 1
+    if [ "$HAVE_TTY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then
+        ask "    Look at the camera, then press Enter: " "" >/dev/null
+    else
+        sleep 1
+    fi
     IR_LEVEL=$(ir_face_brightness)
     if [ -n "$IR_LEVEL" ] && [ "$IR_LEVEL" -ge 40 ]; then
         ok "The infrared light works (face brightness $IR_LEVEL)"
@@ -674,7 +686,15 @@ if [ "$SERVICE_OK" -eq 1 ] && [ "${CAMERA_CHOICE:-${CURRENT_CAMERA:-auto}}" = "i
         fi
         # Without a working light the IR camera is useless, so fall back to
         # the colour camera rather than leave face unlock broken.
-        setup_ir_light || use_colour_camera
+        IR_DONE=0
+        for attempt in 1 2; do
+            if setup_ir_light; then IR_DONE=1; break; fi
+            [ "$attempt" -eq 2 ] && break
+            case "$(ask '    Try switching the light on again? [Y/n] ' y)" in
+                [Nn]*) break ;;
+            esac
+        done
+        [ "$IR_DONE" -eq 1 ] || use_colour_camera
     fi
 fi
 
