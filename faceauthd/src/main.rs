@@ -1,669 +1,590 @@
-use faceauth_core::{AuthRequest, AuthResponse, SOCKET_PATH};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Semaphore;
-use std::fs;
-use std::path::Path;
-use anyhow::Result;
-use log::{info, error, warn};
-use std::sync::{Arc, Mutex};
+//! faceauthd — owns the camera and the face models, answers the PAM module,
+//! the CLI and the GUI over a Unix socket. See docs/DESIGN.md.
 
+mod auth;
 mod camera;
-mod recognition;
-mod storage;
-mod detection;
 mod config;
+mod detection;
+mod enroll;
 mod liveness;
+mod polkit;
+mod recognition;
 mod security;
+mod storage;
+mod users;
 
+use anyhow::{Context, Result};
+use auth::Pipeline;
 use camera::CameraManager;
-use recognition::FaceEngine;
-use detection::FaceDetector;
-use storage::{SecureStorage, UserProfile};
 use config::Config;
-use security::{RateLimiter, AuditLogger};
+use detection::FaceDetector;
+use faceauth_core::{
+    encode_message, is_safe_username, AuthOutcome, EnrollEvent, EnrollFailure, EnrollMode, EnrolledUser, Request,
+    Response, UserStatus, DAEMON_USER, MAX_MESSAGE_BYTES, MAX_SAMPLES, PROTOCOL_VERSION, SOCKET_DIR, VERSION,
+};
+use log::{error, info, warn};
+use recognition::FaceEngine;
+use security::{AuditLogger, ChangeGuard, RateLimiter};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use storage::{SecureStorage, UserProfile};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 
-fn check_system_capabilities() -> Result<()> {
-    // 1. Check Memory via /proc/meminfo
-    if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
-        for line in meminfo.lines() {
-            if line.starts_with("MemAvailable:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(kb) = parts[1].parse::<u64>() {
-                        let mb = kb / 1024;
-                        info!("System Capability Check: {} MB RAM available", mb);
-                        if mb < 500 {
-                            warn!("Low memory detected ({} MB). Processing might be slow or unstable.", mb);
-                        }
+/// A connected client is dropped after this long without sending a request.
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Concurrent connections beyond this are refused.
+const MAX_CLIENTS: usize = 64;
+/// How long an authentication waits for a running one to finish.
+const AUTH_QUEUE_WAIT: Duration = Duration::from_secs(5);
+/// How long to wait for the camera when it is in use.
+const CAMERA_WAIT: Duration = Duration::from_millis(1500);
+
+struct Daemon {
+    config: Config,
+    camera: Mutex<CameraManager>,
+    camera_label: Mutex<Option<String>>,
+    /// The camera is infrared (decided at startup).
+    infrared: bool,
+    detector: FaceDetector,
+    engine: FaceEngine,
+    storage: SecureStorage,
+    limiter: RateLimiter,
+    /// One face pipeline at a time: parallel ONNX runs just fight for the CPU.
+    auth_gate: Semaphore,
+    changes: ChangeGuard,
+}
+
+impl Daemon {
+    fn pipeline(&self) -> Pipeline<'_> {
+        Pipeline { config: &self.config, detector: &self.detector, engine: &self.engine, infrared: self.infrared }
+    }
+
+    /// The profile was made with this recognizer and this kind of camera.
+    fn profile_usable(&self, p: &UserProfile) -> bool {
+        p.usable_with(&self.engine.model_id, self.infrared)
+    }
+
+    fn camera_label(&self) -> Option<String> {
+        if let Some(label) = self.camera_label.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            return Some(label);
+        }
+        let label = self.camera.try_lock().ok()?.describe();
+        *self.camera_label.lock().unwrap_or_else(|p| p.into_inner()) = label.clone();
+        label
+    }
+}
+
+/// The process on the other end of the socket, as reported by the kernel.
+#[derive(Clone, Copy, Debug)]
+struct Peer {
+    uid: u32,
+    pid: Option<i32>,
+}
+
+impl Peer {
+    /// Root (PAM inside sudo/su/GDM/SDDM, polkit helpers) may act for anyone;
+    /// others only for themselves (GUI, CLI, screen lockers running as the user).
+    fn may_act_for(&self, user: &str) -> bool {
+        self.uid == 0 || users::uid_of(user) == Some(self.uid)
+    }
+}
+
+fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    info!("faceauthd {VERSION} starting");
+    log_system_facts();
+
+    let config = Config::load()?;
+    info!("Configuration: {config:?}");
+    let models = config::models_dir();
+    let detector = FaceDetector::new(&models, config.detection.confidence_threshold)?;
+    let engine = FaceEngine::new(&models, config.recognition.model, config.recognition.effective_threads())?;
+    let storage = SecureStorage::new(config::state_dir())?;
+    let camera = CameraManager::new(&config.camera.device, config.camera.ir_emitter.clone())?;
+    let label = camera.describe();
+    let infrared = camera.is_infrared();
+    match &label {
+        Some(l) => info!("Camera: {l}{}", if infrared { " [infrared]" } else { "" }),
+        None => warn!("No camera found yet; will look again on first use"),
+    }
+
+    let daemon = Arc::new(Daemon {
+        limiter: RateLimiter::new(config.security.max_attempts, config.security.lockout_seconds),
+        config,
+        camera: Mutex::new(camera),
+        camera_label: Mutex::new(label),
+        infrared,
+        detector,
+        engine,
+        storage,
+        auth_gate: Semaphore::new(1),
+        changes: ChangeGuard::default(),
+    });
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?
+        .block_on(serve(daemon))
+}
+
+async fn serve(daemon: Arc<Daemon>) -> Result<()> {
+    let socket = config::socket_path();
+    let listener = bind(&socket)?;
+    info!("Listening on {}", socket.display());
+
+    let me = users::name_of(users::effective_uid());
+    if users::effective_uid() != 0 && me.as_deref() != Some(DAEMON_USER) {
+        warn!("Running as {me:?}: development mode. The PAM module will not trust this daemon.");
+    }
+
+    let clients = Arc::new(Semaphore::new(MAX_CLIENTS));
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = match accepted {
+                    Ok(s) => s,
+                    Err(e) => { error!("accept failed: {e}"); continue; }
+                };
+                let peer = match stream.peer_cred() {
+                    Ok(c) => Peer { uid: c.uid(), pid: c.pid() },
+                    Err(e) => { warn!("Rejecting client without peer credentials: {e}"); continue; }
+                };
+                let Ok(permit) = clients.clone().try_acquire_owned() else {
+                    warn!("Too many clients; refusing uid {}", peer.uid);
+                    continue;
+                };
+                let daemon = daemon.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_client(stream, peer, daemon).await {
+                        warn!("Client uid {}: {e:#}", peer.uid);
                     }
-                }
+                    drop(permit);
+                });
             }
+            _ = term.recv() => break,
+            _ = tokio::signal::ctrl_c() => break,
         }
     }
-
-    // 2. Check CPU Cores
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    info!("System Capability Check: {} CPU cores detected", cores);
-    if cores < 2 {
-        warn!("Single-core CPU detected. Performance might be impacted.");
-    }
-
-    // 3. Check Disk Space on / (Root)
-    match std::process::Command::new("df").arg("-P").arg("/").output() {
-        Ok(output) => {
-            if let Ok(stdout) = String::from_utf8(output.stdout) {
-                let lines: Vec<&str> = stdout.lines().collect();
-                // Expect header + 1 line
-                if lines.len() >= 2 {
-                    let parts: Vec<&str> = lines[1].split_whitespace().collect();
-                    // Fields: Filesystem 1024-blocks Used Available Capacity Mounted on
-                    // Available is index 3
-                    if parts.len() >= 4 {
-                        if let Ok(avail_kb) = parts[3].parse::<u64>() {
-                            let avail_mb = avail_kb / 1024;
-                            info!("System Capability Check: {} MB Disk Space available on /", avail_mb);
-                            if avail_mb < 500 { // Less than 500MB
-                                warn!("Critical: Very low disk space ({} MB). System might hang on logging or writes.", avail_mb);
-                            } else if avail_mb < 2048 { // Less than 2GB
-                                warn!("Low disk space ({} MB).", avail_mb);
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        Err(e) => {
-            warn!("Could not check disk space: {}", e);
-        }
-    }
-
+    let _ = fs::remove_file(&socket);
+    info!("faceauthd stopped");
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Force info level if RUST_LOG is not set
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
-    }
-    env_logger::init();
-    info!("Starting faceauthd (Phase 4)...");
-
-    // Perform Infrastructure Checks
-    if let Err(e) = check_system_capabilities() {
-        warn!("Failed to perform system capability checks: {}", e);
-    }
-
-    let config = match Config::load() {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            error!("Failed to load config: {}", e);
-            return Err(e);
+/// Bind the socket. The production directory is created by systemd
+/// (`RuntimeDirectory=faceauth`) and owned by the daemon user; nobody else can
+/// create or replace files in it.
+fn bind(socket: &Path) -> Result<UnixListener> {
+    let dir = socket.parent().context("socket path has no parent directory")?;
+    if !dir.exists() {
+        fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+        if dir == Path::new(SOCKET_DIR) {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
         }
-    };
-    info!("Configuration loaded: {:?}", config);
-
-    // Initialize Rate Limiter
-    let rate_limiter = Arc::new(RateLimiter::new(config.security.max_attempts, config.security.lockout_seconds));
-
-    // Initialize Camera
-    let mut cam_manager = CameraManager::new();
-    if let Err(e) = cam_manager.initialize() {
-        error!("Failed to initialize camera: {}. Continuing without camera for now.", e);
     }
-    let cam_manager = Arc::new(Mutex::new(cam_manager));
-
-    // Initialize Face Detector
-    let detector = match FaceDetector::new(Path::new("/usr/share/faceauth/models/det_500m.onnx"), config.detection.confidence_threshold) {
-        Ok(d) => Arc::new(d),
-        Err(e) => {
-            error!("Failed to initialize Face Detector: {}", e);
-            // We can't proceed securely without detection
-            return Err(e);
-        }
-    };
-
-    // Initialize Face Engine
-    let face_engine = match FaceEngine::new() {
-        Ok(engine) => Arc::new(engine),
-        Err(e) => {
-            error!("Failed to initialize Face Engine: {}", e);
-            return Err(e);
-        }
-    };
-
-    // Initialize Storage
-    let storage = match SecureStorage::new() {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            error!("Failed to initialize Secure Storage: {}", e);
-            return Err(e);
-        }
-    };
-
-    // Auth semaphore: only ONE authentication pipeline runs at a time.
-    // Without this, PAM retries or simultaneous login attempts each spawn their
-    // own ONNX inference, which fight for the same CPU cores and cause the
-    // 100% CPU burst on failure or after wake-from-sleep.
-    let auth_semaphore = Arc::new(Semaphore::new(1));
-
-    if Path::new(SOCKET_PATH).exists() {
-        fs::remove_file(SOCKET_PATH)?;
+    match fs::remove_file(socket) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("Failed to remove stale {}", socket.display())),
     }
+    let listener = UnixListener::bind(socket).with_context(|| format!("Failed to bind {}", socket.display()))?;
+    // Anyone may connect; what each caller may do is decided per request.
+    fs::set_permissions(socket, fs::Permissions::from_mode(0o666))?;
+    Ok(listener)
+}
 
-    let listener = UnixListener::bind(SOCKET_PATH)?;
-    info!("Listening on {}", SOCKET_PATH);
-
-    use std::os::unix::fs::PermissionsExt;
-    // Security: Use 666 (RW-RW-RW-) instead of 777.
-    // Executable permission is not needed for sockets.
-    // 666 allows PAM (root) and GUI (user) to connect.
-    fs::set_permissions(SOCKET_PATH, fs::Permissions::from_mode(0o666))?;
-
+async fn handle_client(stream: UnixStream, peer: Peer, d: Arc<Daemon>) -> Result<()> {
+    let (mut rd, mut wr) = stream.into_split();
     loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let cam_clone = cam_manager.clone();
-                let detector_clone = detector.clone();
-                let engine_clone = face_engine.clone();
-                let storage_clone = storage.clone();
-                let config_clone = config.clone();
-                let rate_limiter_clone = rate_limiter.clone();
-                let semaphore_clone = auth_semaphore.clone();
-                
-                tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, cam_clone, detector_clone, engine_clone, storage_clone, config_clone, rate_limiter_clone, semaphore_clone).await {
-                        error!("Error handling client: {}", e);
-                    }
-                });
+        let Some(request) = read_request(&mut rd, peer).await? else { return Ok(()) };
+        match request {
+            Request::Ping => send(&mut wr, &Response::Pong { version: VERSION.into(), protocol: PROTOCOL_VERSION }).await?,
+            Request::Status => send(&mut wr, &status(&d, peer)).await?,
+            Request::Authenticate { user } => authenticate(&d, peer, user, &mut wr).await?,
+            Request::Enroll { mode, user } => enroll_session(&d, peer, mode, user, &mut rd, &mut wr).await?,
+            Request::Remove { user } => remove(&d, peer, user, &mut rd, &mut wr).await?,
+            Request::ListEnrolled => send(&mut wr, &list_enrolled(&d, peer)).await?,
+            Request::Cameras => {
+                let selected = d.camera.try_lock().ok().and_then(|c| c.selected_index());
+                let devices = tokio::task::spawn_blocking(move || camera::describe_devices(selected)).await?;
+                send(&mut wr, &Response::Cameras(devices)).await?
             }
-            Err(e) => {
-                error!("Accept failed: {}", e);
-            }
+            Request::Benchmark => send(&mut wr, &benchmark(&d).await).await?,
         }
     }
 }
 
-async fn handle_client(
-    mut stream: UnixStream, 
-    camera: Arc<Mutex<CameraManager>>,
-    detector: Arc<FaceDetector>,
-    engine: Arc<FaceEngine>,
-    storage: Arc<SecureStorage>,
-    config: Arc<Config>,
-    rate_limiter: Arc<RateLimiter>,
-    auth_semaphore: Arc<Semaphore>,
+async fn read_request(rd: &mut OwnedReadHalf, peer: Peer) -> Result<Option<Request>> {
+    let mut len_buf = [0u8; 4];
+    match tokio::time::timeout(CLIENT_IDLE_TIMEOUT, rd.read_exact(&mut len_buf)).await {
+        Err(_) => return Ok(None),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Ok(Err(e)) => return Err(e.into()),
+        Ok(Ok(_)) => {}
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_MESSAGE_BYTES {
+        warn!("Dropping uid {}: {len}-byte message exceeds the limit", peer.uid);
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; len];
+    tokio::time::timeout(CLIENT_IDLE_TIMEOUT, rd.read_exact(&mut buf))
+        .await
+        .context("timed out reading a request")??;
+    Ok(Some(serde_json::from_slice(&buf).context("malformed request")?))
+}
+
+async fn send(wr: &mut OwnedWriteHalf, response: &Response) -> Result<()> {
+    wr.write_all(&encode_message(response)?).await?;
+    Ok(())
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// The user a change request acts on: non-root callers act on themselves;
+/// root must name an existing user.
+fn resolve_target(peer: Peer, requested: Option<String>) -> Result<String, String> {
+    let me = users::name_of(peer.uid);
+    match (peer.uid, requested) {
+        (0, Some(user)) => {
+            if is_safe_username(&user) && users::uid_of(&user).is_some() {
+                Ok(user)
+            } else {
+                Err(format!("no such user {user:?}"))
+            }
+        }
+        (0, None) => Err("root must name a user (--user NAME)".into()),
+        (_, None) => me.ok_or_else(|| "your account could not be looked up".into()),
+        (_, Some(user)) if Some(&user) == me.as_ref() => Ok(user),
+        (_, Some(_)) => Err("you can only change your own face data".into()),
+    }
+}
+
+fn status(d: &Daemon, peer: Peer) -> Response {
+    let Some(user) = users::name_of(peer.uid) else {
+        return Response::Error { message: "your account could not be looked up".into() };
+    };
+    let profile = match d.storage.load_user(&user) {
+        Ok(p) => p,
+        Err(e) => return Response::Error { message: format!("{e:#}") },
+    };
+    let (enrolled, samples, created, updated, model_current) = match &profile {
+        Some(p) if !p.embeddings.is_empty() => {
+            (true, p.embeddings.len(), p.created, p.updated, d.profile_usable(p))
+        }
+        _ => (false, 0, 0, 0, true),
+    };
+    Response::Status(UserStatus {
+        user,
+        enrolled,
+        samples,
+        max_samples: MAX_SAMPLES,
+        created,
+        updated,
+        model_current,
+        camera: d.camera_label(),
+        infrared: d.infrared,
+        recognizer: d.config.recognition.model.describe().to_string(),
+    })
+}
+
+fn list_enrolled(d: &Daemon, peer: Peer) -> Response {
+    match d.storage.list_users() {
+        Ok(profiles) => Response::Users(
+            profiles
+                .into_iter()
+                .filter(|p| peer.may_act_for(&p.user))
+                .map(|p| EnrolledUser {
+                    model_current: d.profile_usable(&p),
+                    samples: p.embeddings.len(),
+                    updated: p.updated,
+                    user: p.user,
+                })
+                .collect(),
+        ),
+        Err(e) => Response::Error { message: format!("{e:#}") },
+    }
+}
+
+// ─── Authentication ─────────────────────────────────────────────────────────
+
+async fn authenticate(d: &Arc<Daemon>, peer: Peer, user: String, wr: &mut OwnedWriteHalf) -> Result<()> {
+    if !is_safe_username(&user) || !peer.may_act_for(&user) {
+        AuditLogger::denied("authenticate", Some(&user), peer.uid, "caller is neither root nor the user");
+        return send(wr, &Response::Denied { reason: "you can only authenticate yourself".into() }).await;
+    }
+    let outcome = |o: AuthOutcome| Response::Auth(o);
+
+    // Cheap checks first: none of these touch the camera.
+    let profile = match d.storage.load_user(&user) {
+        Ok(Some(p)) if !p.embeddings.is_empty() => p,
+        Ok(_) => return send(wr, &outcome(AuthOutcome::NotEnrolled)).await,
+        Err(e) => {
+            error!("Profile for {user}: {e:#}");
+            return send(wr, &Response::Error { message: "face data could not be read".into() }).await;
+        }
+    };
+    if !d.profile_usable(&profile) {
+        warn!(
+            "{user} was set up with model {:?} on a {} camera; now model {} on a {} camera",
+            profile.model_id,
+            if profile.infrared { "infrared" } else { "colour" },
+            d.engine.model_id,
+            if d.infrared { "infrared" } else { "colour" }
+        );
+        return send(wr, &outcome(AuthOutcome::ModelChanged)).await;
+    }
+    if let Some(left) = d.limiter.locked_for(&user) {
+        return send(wr, &outcome(AuthOutcome::LockedOut { seconds: left.as_secs().max(1) })).await;
+    }
+    if d.changes.is_changing(&user) {
+        info!("Refusing face authentication for {user}: their face data is being changed");
+        return send(wr, &outcome(AuthOutcome::Busy)).await;
+    }
+    let Ok(Ok(_permit)) = tokio::time::timeout(AUTH_QUEUE_WAIT, d.auth_gate.acquire()).await else {
+        return send(wr, &outcome(AuthOutcome::Busy)).await;
+    };
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let worker = {
+        let d = d.clone();
+        tokio::task::spawn_blocking(move || {
+            let Some(camera) = camera::lock_camera(&d.camera, CAMERA_WAIT) else {
+                return auth::Verdict { outcome: AuthOutcome::CameraUnavailable, best_score: 0.0 };
+            };
+            let _ = ready_tx.send(());
+            auth::verify(&camera, &d.pipeline(), &profile.embeddings)
+        })
+    };
+    if ready_rx.await.is_ok() {
+        // Tell PAM to show "look at the camera" now that capture is starting.
+        if send(wr, &Response::Scanning).await.is_err() {
+            // PAM gave up; still finish so the camera closes cleanly.
+            let _ = worker.await;
+            return Ok(());
+        }
+    }
+    let verdict = worker.await?;
+
+    match verdict.outcome {
+        AuthOutcome::Matched => d.limiter.reset(&user),
+        // Only a face that was seen and rejected is an impostor attempt.
+        AuthOutcome::NotMatched | AuthOutcome::NotLive => d.limiter.record_failure(&user),
+        AuthOutcome::NoFace | AuthOutcome::BadLighting => {
+            // Back-pressure: let the sensor settle before PAM retries.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        _ => {}
+    }
+    AuditLogger::auth(&user, &verdict.outcome, verdict.best_score, peer.uid);
+    send(wr, &outcome(verdict.outcome)).await
+}
+
+async fn benchmark(d: &Arc<Daemon>) -> Response {
+    let Ok(Ok(_permit)) = tokio::time::timeout(AUTH_QUEUE_WAIT, d.auth_gate.acquire()).await else {
+        return Response::Error { message: "face unlock is busy".into() };
+    };
+    let d2 = d.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let camera = camera::lock_camera(&d2.camera, CAMERA_WAIT).context("camera is in use")?;
+        auth::benchmark(&camera, &d2.pipeline())
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => Response::Benchmark(report),
+        Ok(Err(e)) => Response::Error { message: format!("{e:#}") },
+        Err(e) => Response::Error { message: format!("benchmark failed: {e}") },
+    }
+}
+
+// ─── Changing face data ─────────────────────────────────────────────────────
+
+/// Completes when the client sends anything or hangs up. Clients send nothing
+/// during a session, so either means "stop".
+async fn client_gone(rd: &mut OwnedReadHalf) {
+    let mut b = [0u8; 1];
+    let _ = rd.read(&mut b).await;
+}
+
+/// Polkit check for a non-root caller. `Ok(())` when allowed, otherwise the
+/// failure to report (`None` when the client already left).
+async fn authorize(peer: Peer, rd: &mut OwnedReadHalf) -> Result<(), Option<EnrollFailure>> {
+    if peer.uid == 0 {
+        return Ok(());
+    }
+    let Some(pid) = peer.pid else { return Err(Some(EnrollFailure::NotAuthorized)) };
+    match polkit::check(pid, peer.uid, client_gone(rd)).await {
+        polkit::Decision::Authorized => Ok(()),
+        polkit::Decision::NotAuthorized => Err(Some(EnrollFailure::NotAuthorized)),
+        polkit::Decision::NoAgent => Err(Some(EnrollFailure::NoAuthAgent)),
+        polkit::Decision::Dismissed => Err(Some(EnrollFailure::AuthCancelled)),
+        polkit::Decision::Abandoned => Err(None),
+        polkit::Decision::Error(e) => {
+            error!("polkit: {e}");
+            Err(Some(EnrollFailure::Internal { message: e }))
+        }
+    }
+}
+
+async fn enroll_session(
+    d: &Arc<Daemon>,
+    peer: Peer,
+    mode: EnrollMode,
+    requested: Option<String>,
+    rd: &mut OwnedReadHalf,
+    wr: &mut OwnedWriteHalf,
 ) -> Result<()> {
-    loop {
-        // Read length prefix
-        let mut len_buf = [0u8; 4];
-        match stream.read_exact(&mut len_buf).await {
-            Ok(_) => {},
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e.into()),
+    let fail = |f: EnrollFailure| Response::Enroll(EnrollEvent::Failed(f));
+    let user = match resolve_target(peer, requested.clone()) {
+        Ok(u) => u,
+        Err(reason) => {
+            AuditLogger::denied("enroll", requested.as_deref(), peer.uid, &reason);
+            return send(wr, &Response::Denied { reason }).await;
         }
-        let len = u32::from_be_bytes(len_buf) as usize;
+    };
+    // Held until the session ends: blocks face auth for this user meanwhile.
+    let Some(_ticket) = d.changes.begin(&user) else {
+        return send(wr, &fail(EnrollFailure::InProgress)).await;
+    };
 
-        // Read body
-        let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await?;
+    let existing = match d.storage.load_user(&user) {
+        Ok(p) => p.filter(|p| !p.embeddings.is_empty()),
+        Err(e) => return send(wr, &fail(EnrollFailure::Internal { message: format!("{e:#}") })).await,
+    };
+    let base: Vec<Vec<f32>> = match (mode, &existing) {
+        (EnrollMode::Append, None) => return send(wr, &fail(EnrollFailure::NotEnrolled)).await,
+        (EnrollMode::Append, Some(p)) if !d.profile_usable(p) => return send(wr, &fail(EnrollFailure::DoesNotMatch)).await,
+        (EnrollMode::Append, Some(p)) if p.embeddings.len() + enroll::steps(mode).len() > MAX_SAMPLES => {
+            return send(wr, &fail(EnrollFailure::Full { max: MAX_SAMPLES })).await
+        }
+        (EnrollMode::Append, Some(p)) => p.embeddings.clone(),
+        (EnrollMode::Replace, _) => Vec::new(),
+    };
 
-        let request: AuthRequest = serde_json::from_slice(&buf)?;
-        // info!("Received request: {:?}", request); // Too verbose for frames
+    send(wr, &Response::Enroll(EnrollEvent::Authorizing)).await?;
+    if let Err(failure) = authorize(peer, rd).await {
+        if let Some(f) = &failure {
+            AuditLogger::denied("enroll", Some(&user), peer.uid, &f.message());
+            send(wr, &fail(f.clone())).await?;
+        }
+        return Ok(());
+    }
+    AuditLogger::event("ENROLL_START", &user, peer.uid, &format!("mode={mode:?}"));
 
-        let response = match request {
-            AuthRequest::Ping => AuthResponse::Pong,
-
-            AuthRequest::Benchmark => {
-                info!("Running benchmark...");
-                let start = std::time::Instant::now();
-                
-                // 1. Capture Sequence (Full Pipeline Simulation)
-                let cap_start = std::time::Instant::now();
-                // 1. Overlapped Capture & Detection
-                let cap_start = std::time::Instant::now();
-                
-                let camera_clone = camera.clone();
-                let config_clone = config.clone();
-                let detector_clone = detector.clone();
-
-                let (tx_frame0, rx_frame0) = tokio::sync::oneshot::channel();
-                let (tx_full, rx_full) = tokio::sync::oneshot::channel();
-
-                tokio::spawn(async move {
-                    let res = tokio::task::spawn_blocking(move || {
-                        let cam_mgr = match camera_clone.lock() {
-                            Ok(g) => g,
-                            Err(poisoned) => { warn!("Camera mutex poisoned, recovering"); poisoned.into_inner() }
-                        };
-                        let mut active_cam = cam_mgr.start_session(config_clone.camera.warmup_frames)?;
-                        let frame0 = active_cam.capture_frame()?;;
-                        let _ = tx_frame0.send(frame0.clone());
-                        let remaining = config_clone.camera.sequence_length - 1;
-                        let rest = active_cam.capture_sequence(remaining, config_clone.camera.sequence_interval_ms)?;
-                        Ok((frame0, rest))
-                    }).await;
-                    let final_res = match res {
-                        Ok(r) => r,
-                        Err(e) => Err(anyhow::anyhow!("Task join error: {}", e)),
-                    };
-                    let _ = tx_full.send(final_res);
-                });
-
-                let frame0_res = rx_frame0.await;
-                
-                if let Ok(frame0) = frame0_res {
-                    let det_start = std::time::Instant::now();
-                    let frame0_clone = frame0.clone();
-                    let detection_task = tokio::task::spawn_blocking(move || {
-                        detector_clone.detect(&frame0_clone)
-                    });
-
-                    let full_res = rx_full.await;
-                    let cap_time = cap_start.elapsed().as_secs_f32() * 1000.0;
-
-                    if let Ok(Ok((_, remaining))) = full_res {
-                        let detection = detection_task.await;
-                        let det_time = det_start.elapsed().as_secs_f32() * 1000.0;
-
-                        let mut frames = vec![frame0];
-                        frames.extend(remaining);
-
-                        let rec_start = std::time::Instant::now();
-                        if let Ok(Ok(Some(face))) = detection {
-                            let engine_clone = engine.clone();
-                            let face_clone = face.clone();
-                            let mut tasks = Vec::new();
-                            for _ in 0..frames.len() {
-                                let e = engine_clone.clone();
-                                let f = face_clone.clone();
-                                tasks.push(tokio::task::spawn_blocking(move || {
-                                    e.get_embedding(&f)
-                                }));
-                            }
-                            futures::future::join_all(tasks).await;
-                        }
-                        let rec_time = rec_start.elapsed().as_secs_f32() * 1000.0;
-                        let total_time = start.elapsed().as_secs_f32() * 1000.0;
-
-                        info!("Benchmark: Cap={:.2}ms, Det={:.2}ms, Rec={:.2}ms, Total={:.2}ms", cap_time, det_time, rec_time, total_time);
-                        AuthResponse::BenchmarkResult { 
-                            detection_ms: det_time, 
-                            recognition_ms: rec_time,
-                            capture_ms: cap_time,
-                            total_ms: total_time
-                        }
-                    } else {
-                        error!("Benchmark failed: Camera error");
-                        AuthResponse::Failure
-                    }
-                } else {
-                    error!("Benchmark failed: Frame 0 error");
-                    AuthResponse::Failure
-                }
+    // Capture runs on a blocking thread; events flow back through `rx`.
+    let (tx, mut rx) = mpsc::channel::<Response>(4);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let (d, cancel, base) = (d.clone(), cancel.clone(), base.clone());
+        tokio::task::spawn_blocking(move || {
+            let Some(camera) = camera::lock_camera(&d.camera, CAMERA_WAIT) else {
+                return enroll::Finish::Failed(EnrollFailure::CameraUnavailable);
+            };
+            enroll::capture(&camera, &d.pipeline(), mode, &base, &tx, &cancel)
+        })
+    };
+    loop {
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(m) => if send(wr, &m).await.is_err() { cancel.store(true, Ordering::Relaxed); break; },
+                None => break,
             },
-            
-            AuthRequest::Enroll { user: _, name: _ } => {
-                // Legacy enroll (daemon captures)
-                // For now, we just return success to acknowledge
-                AuthResponse::EnrollmentStatus { message: "Ready for samples".to_string(), progress: 0.0 }
-            },
+            _ = client_gone(rd) => { cancel.store(true, Ordering::Relaxed); break; }
+        }
+    }
+    drop(rx);
 
-            AuthRequest::EnrollSample { user, image_data, width, height } => {
-                // Process the frame sent by GUI
-                if let Some(img) = image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(width, height, image_data) {
-                    
-                    // 1. Detect Face in the raw frame
-                    match detector.detect(&img) {
-                        Ok(Some(cropped_face)) => {
-                             // 2. Get Embedding from cropped face
-                             match engine.get_embedding(&cropped_face) {
-                                Ok(embedding) => {
-                                    // Load existing profile or create new
-                                    let mut profile = storage.load_user(&user)?.unwrap_or(UserProfile {
-                                        user: user.clone(),
-                                        name: user.clone(),
-                                        embeddings: vec![],
-                                        last_updated: 0,
-                                    });
-                                    
-                                    // Check for duplicates
-                                    let mut is_duplicate = false;
-                                    for existing in &profile.embeddings {
-                                        let score = engine.compare(&embedding, existing);
-                                        if score > 0.95 {
-                                            is_duplicate = true;
-                                            break;
-                                        }
-                                    }
-
-                                    if is_duplicate {
-                                        AuthResponse::EnrollmentStatus { 
-                                            message: "Hold steady or turn slightly".to_string(), 
-                                            progress: profile.embeddings.len() as f32 
-                                        }
-                                    } else {
-                                        profile.embeddings.push(embedding);
-                                        profile.last_updated = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
-                                        
-                                        storage.save_user(&profile)?;
-                                        AuthResponse::Success
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("Embedding failed: {}", e);
-                                    AuthResponse::Failure
-                                }
-                            }
-                        },
-                        Ok(None) => {
-                            // No face detected
-                             AuthResponse::EnrollmentStatus { 
-                                message: "No face detected".to_string(), 
-                                progress: -1.0 
-                            }
-                        },
-                        Err(e) => {
-                             error!("Detection failed: {}", e);
-                             AuthResponse::Failure
-                        }
-                    }
-                } else {
-                    AuthResponse::Failure
-                }
-            },
-
-            AuthRequest::ListEnrolled => {
-                match storage.list_users() {
-                    Ok(users) => AuthResponse::EnrolledList(users),
-                    Err(e) => {
-                        error!("Failed to list users: {}", e);
-                        AuthResponse::Failure
-                    }
-                }
-            },
-
-            AuthRequest::DeleteUser { user } => {
-                info!("Deleting enrollment data for user: {}", user);
-                match storage.delete_user(&user) {
-                    Ok(_) => AuthResponse::Success,
-                    Err(e) => {
-                        error!("Failed to delete user {}: {}", user, e);
-                        AuthResponse::Failure
-                    }
-                }
-            },
-
-            AuthRequest::Authenticate { user } => {
-                info!("Authenticating user: {}", user);
-
-                // 0. Rate Limit Check
-                if !rate_limiter.check_allowed(&user) {
-                    warn!("Authentication rejected by rate limiter for user {}", user);
-                    return send_response(&mut stream, AuthResponse::Failure).await;
-                }
-
-                // Acquire semaphore — only 1 auth pipeline at a time.
-                // If another auth is already running (PAM retry storm, simultaneous
-                // logins), wait up to 10s for it to finish rather than spawning a
-                // competing ONNX session.
-                let _auth_permit = match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    auth_semaphore.acquire(),
-                ).await {
-                    Ok(Ok(permit)) => permit,
-                    _ => {
-                        warn!("Auth semaphore timeout for user {} — another auth is running", user);
-                        return send_response(&mut stream, AuthResponse::Failure).await;
-                    }
-                };
-                // _auth_permit is dropped (released) at the end of this block
-                
-                // 1. Load user profile
-                let profile = match storage.load_user(&user) {
-                    Ok(Some(p)) => {
-                        if p.embeddings.is_empty() {
-                            warn!("User {} has no enrolled faces", user);
-                            return send_response(&mut stream, AuthResponse::Failure).await;
-                        }
-                        p
-                    },
-                    Ok(None) => {
-                        warn!("User {} not found", user);
-                        return send_response(&mut stream, AuthResponse::Failure).await;
-                    },
-                    Err(e) => {
-                        error!("Storage error: {}", e);
-                        return send_response(&mut stream, AuthResponse::Failure).await;
-                    }
-                };
-
-                // 2. Overlapped Capture & Processing Strategy (Phase 7A)
-                let camera_clone = camera.clone();
-                let config_clone = config.clone();
-                
-                // Channels for coordinating overlap
-                let (tx_frame0, rx_frame0) = tokio::sync::oneshot::channel();
-                let (tx_full, rx_full) = tokio::sync::oneshot::channel();
-
-                // Spawn Camera Task
-                tokio::spawn(async move {
-                    // Move into blocking thread for I/O
-                    let res = tokio::task::spawn_blocking(move || {
-                        // Acquire lock inside blocking task
-                        let cam_mgr = match camera_clone.lock() {
-                            Ok(g) => g,
-                            Err(poisoned) => { warn!("Camera mutex poisoned, recovering"); poisoned.into_inner() }
-                        };
-                        
-                        // Start Session — adaptive settle+warmup is handled inside start_session()
-                        let mut active_cam = match cam_mgr.start_session(config_clone.camera.warmup_frames) {
-                            Ok(cam) => cam,
-                            Err(e) => {
-                                warn!("Camera busy/unavailable, retrying after 300ms... ({})", e);
-                                std::thread::sleep(std::time::Duration::from_millis(300));
-                                match cam_mgr.start_session(config_clone.camera.warmup_frames) {
-                                    Ok(cam) => cam,
-                                    Err(e2) => {
-                                        error!("Camera init permanently failed: {}", e2);
-                                        // Sleep to prevent tight loop CPU spike if GDM retries rapidly
-                                        std::thread::sleep(std::time::Duration::from_secs(2));
-                                        return Err(e2);
-                                    }
-                                }
-                            }
-                        };
-                        
-                        // Capture Frame 0
-                        let frame0 = active_cam.capture_frame()?;
-                        // Send Frame 0 immediately for detection
-                        let _ = tx_frame0.send(frame0.clone());
-                        
-                        // Capture Remaining Frames
-                        let remaining = config_clone.camera.sequence_length - 1;
-                        let rest = active_cam.capture_sequence(remaining, config_clone.camera.sequence_interval_ms)?;
-                        
-                        Ok((frame0, rest))
-                    }).await;
-
-                    // Handle JoinError and send result
-                    let final_res = match res {
-                        Ok(r) => r,
-                        Err(e) => Err(anyhow::anyhow!("Task join error: {}", e)),
-                    };
-                    let _ = tx_full.send(final_res);
-                });
-
-                // 3. Adaptive Detection & Parallel Recognition
-                
-                // Step 3a: Wait for Frame 0
-                let frame0 = match rx_frame0.await {
-                    Ok(f) => f,
-                    Err(_) => {
-                        // If we didn't get Frame 0, check the full result for the error
-                        match rx_full.await {
-                            Ok(Err(e)) => error!("Camera error: {}", e),
-                            _ => error!("Camera task failed or cancelled"),
-                        }
-                        return send_response(&mut stream, AuthResponse::Failure).await;
-                    }
-                };
-
-                // Step 3a.5: Image quality / brightness guard.
-                // After a long sleep, V4L2 auto-exposure may not have converged.
-                // Log evidence: detection score dropped from 0.79 → 0.33 and recognition
-                // from 0.81 → 0.25 after a 65-min sleep.  The root cause is an under- or
-                // over-exposed frame.  If the mean brightness is outside [20, 235] the
-                // frame is unusable — abort early rather than running ONNX on garbage data.
-                {
-                    let pixels = frame0.as_raw();
-                    let mean_brightness: u64 = pixels.iter().map(|&p| p as u64).sum::<u64>() / pixels.len().max(1) as u64;
-                    if mean_brightness < 20 || mean_brightness > 235 {
-                        warn!("Frame brightness {} is outside acceptable range [20,235] — camera AEC not converged yet. Aborting.", mean_brightness);
-                        // Consume the full camera result so the spawned task can clean up.
-                        let _ = rx_full.await;
-                        rate_limiter.record_failure(&user);
-                        AuditLogger::log_auth_attempt(&user, false, 0.0, false);
-                        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                        return send_response(&mut stream, AuthResponse::Failure).await;
-                    }
-                }
-
-                // Step 3b: Detect face in Frame 0 and produce a 112 × 112 landmark-aligned crop.
-                // The similarity transform is derived from ScrFD's 5-point keypoints, mapping
-                // detected eye/nose/mouth positions to the ArcFace canonical reference coords.
-                // This makes every embedding invariant to scale, in-plane rotation, and
-                // translation — the prerequisite for reliable cosine similarity matching.
-                let detector_clone = detector.clone();
-                let frame0_for_detect = frame0.clone();
-                let detection_task = tokio::task::spawn_blocking(move || {
-                    detector_clone.detect_aligned(&frame0_for_detect)
-                });
-
-                // Step 3c: Wait for Camera Task to Finish (Remaining frames)
-                let (frame0_from_cam, remaining_frames) = match rx_full.await {
-                    Ok(Ok(res)) => res,
-                    Ok(Err(e)) => {
-                        error!("Camera capture failed: {}", e);
-                        return send_response(&mut stream, AuthResponse::Failure).await;
-                    },
-                    Err(_) => {
-                        error!("Camera task panicked or dropped channel");
-                        return send_response(&mut stream, AuthResponse::Failure).await;
-                    }
-                };
-
-                // Reconstruct frames vector
-                let mut frames = vec![frame0_from_cam];
-                frames.extend(remaining_frames);
-
-                // 2.5 Liveness Check (Performed after all frames captured)
-                let liveness_passed = if config.security.require_liveness {
-                    liveness::check_liveness(&frames)
-                } else {
-                    true
-                };
-
-                if !liveness_passed {
-                    warn!("Liveness check failed for user {}", user);
-                    rate_limiter.record_failure(&user);
-                    AuditLogger::log_auth_attempt(&user, false, 0.0, false);
-                    return send_response(&mut stream, AuthResponse::Failure).await;
-                }
-
-                // Step 3d: Await Detection Result
-                let detection_result = detection_task.await;
-
-                let mut crops = Vec::new();
-
-                if let Ok(Ok(Some((face0, kpts)))) = detection_result {
-                    crops.push(face0);
-
-                    // Step 3e: Align frames 1-N using the keypoints from frame 0.
-                    // The face doesn't shift significantly across the ~200 ms capture window
-                    // so the same similarity transform gives consistent 112×112 aligned crops
-                    // for every frame. This is a pure geometric warp (~0.1 ms, no inference).
-                    for i in 1..frames.len() {
-                        crops.push(detector.align_from_kpts(&frames[i], &kpts));
-                    }
-                } else {
-                    warn!("No face detected in first frame. Aborting sequence.");
-                    rate_limiter.record_failure(&user);
-                    AuditLogger::log_auth_attempt(&user, false, 0.0, liveness_passed);
-                    // Back-pressure: give the camera sensor 800ms to stabilize before PAM
-                    // fires the next retry.  Without this, rapid retries re-open the camera
-                    // immediately after a cold-start failure, getting the same stale/dark
-                    // frames.  Evidence: at 14:03:35-45 three attempts ran in under 2 seconds
-                    // and all failed with stale-frame scores.
-                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                    return send_response(&mut stream, AuthResponse::Failure).await;
-                }
-
-                // Step 4: Sequential Recognition in a single blocking thread.
-                // The ONNX session is Mutex-locked — running 5 spawn_blocking tasks in parallel
-                // just creates 5 idle threads competing for one lock (heap explosion, zero benefit).
-                // One thread doing 5 sequential inferences is faster and uses 8MB stack instead of 40MB.
-                let engine_for_rec = engine.clone();
-                let recognition_results = tokio::task::spawn_blocking(move || {
-                    crops.into_iter().map(|crop| engine_for_rec.get_embedding(&crop)).collect::<Vec<_>>()
-                }).await.unwrap_or_default();
-
-                let mut valid_matches = 0;
-                let mut best_score = 0.0;
-
-                for res in recognition_results {
-                    if let Ok(current_embedding) = res {
-                        // 5. Compare with stored embeddings
-                        let mut max_score = 0.0;
-                        for stored_emb in &profile.embeddings {
-                            let score = engine.compare(&current_embedding, stored_emb);
-                            if score > max_score {
-                                max_score = score;
-                            }
-                        }
-                        
-                        if max_score > best_score {
-                            best_score = max_score;
-                        }
-
-                        info!("Match score for {}: {}", user, max_score);
-                        
-                        // Threshold from config
-                        if max_score > config.recognition.match_threshold {
-                            valid_matches += 1;
-                        }
-                    }
-                }
-
-                // Consensus: Need at least 3 matches out of 5 frames (or > 50%)
-                let required_matches = (config.camera.sequence_length / 2) + 1;
-                info!("Consensus result: {}/{} valid matches (required: {})", valid_matches, config.camera.sequence_length, required_matches);
-                
-                if valid_matches >= required_matches {
-                    info!("Authentication SUCCESS for user {}", user);
-                    rate_limiter.reset(&user);
-                    AuditLogger::log_auth_attempt(&user, true, best_score, liveness_passed);
-                    AuthResponse::Success
-                } else {
-                    warn!("Authentication FAILED for user {}. Not enough matches.", user);
-                    rate_limiter.record_failure(&user);
-                    AuditLogger::log_auth_attempt(&user, false, best_score, liveness_passed);
-                    AuthResponse::Failure
-                }
+    match worker.await? {
+        enroll::Finish::Completed(samples) => {
+            let profile = UserProfile {
+                user: user.clone(),
+                created: match (mode, &existing) {
+                    (EnrollMode::Append, Some(p)) if p.created > 0 => p.created,
+                    _ => now(),
+                },
+                updated: now(),
+                model_id: Some(d.engine.model_id.clone()),
+                infrared: d.infrared,
+                embeddings: base.into_iter().chain(samples).collect(),
+            };
+            let total = profile.embeddings.len();
+            if let Err(e) = d.storage.save_user(&profile) {
+                error!("Saving profile for {user}: {e:#}");
+                return send(wr, &fail(EnrollFailure::Internal { message: "face data could not be saved".into() })).await;
             }
-        };
-
-        send_response(&mut stream, response).await?;
+            d.limiter.reset(&user);
+            AuditLogger::event("ENROLL_DONE", &user, peer.uid, &format!("mode={mode:?} samples={total}"));
+            send(wr, &Response::Enroll(EnrollEvent::Completed { samples: total })).await
+        }
+        enroll::Finish::Failed(f) => {
+            AuditLogger::event("ENROLL_FAILED", &user, peer.uid, &format!("{f:?}"));
+            send(wr, &fail(f)).await
+        }
+        enroll::Finish::Cancelled => {
+            AuditLogger::event("ENROLL_CANCELLED", &user, peer.uid, "");
+            Ok(())
+        }
     }
 }
 
-async fn send_response(stream: &mut UnixStream, response: AuthResponse) -> Result<()> {
-    let response_data = serde_json::to_vec(&response)?;
-    let len = response_data.len() as u32;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&response_data).await?;
-    Ok(())
+async fn remove(
+    d: &Arc<Daemon>,
+    peer: Peer,
+    requested: Option<String>,
+    rd: &mut OwnedReadHalf,
+    wr: &mut OwnedWriteHalf,
+) -> Result<()> {
+    let user = match resolve_target(peer, requested.clone()) {
+        Ok(u) => u,
+        Err(reason) => {
+            AuditLogger::denied("remove", requested.as_deref(), peer.uid, &reason);
+            return send(wr, &Response::Denied { reason }).await;
+        }
+    };
+    let Some(_ticket) = d.changes.begin(&user) else {
+        return send(wr, &Response::Enroll(EnrollEvent::Failed(EnrollFailure::InProgress))).await;
+    };
+    if let Err(failure) = authorize(peer, rd).await {
+        if let Some(f) = failure {
+            AuditLogger::denied("remove", Some(&user), peer.uid, &f.message());
+            send(wr, &Response::Enroll(EnrollEvent::Failed(f))).await?;
+        }
+        return Ok(());
+    }
+    match d.storage.delete_user(&user) {
+        Ok(()) => {
+            d.limiter.reset(&user);
+            AuditLogger::event("ENROLL_REMOVED", &user, peer.uid, "");
+            send(wr, &Response::Removed).await
+        }
+        Err(e) => {
+            error!("Removing face data for {user}: {e:#}");
+            send(wr, &Response::Error { message: "face data could not be removed".into() }).await
+        }
+    }
 }
 
-
+fn log_system_facts() {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let mem_mb = fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+        m.lines()
+            .find(|l| l.starts_with("MemAvailable:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .map(|kb| kb / 1024)
+    });
+    info!("{cores} CPU cores, {} MB RAM available", mem_mb.map_or("?".into(), |m| m.to_string()));
+    if mem_mb.is_some_and(|m| m < 500) {
+        warn!("Low memory; face processing may be slow");
+    }
+}

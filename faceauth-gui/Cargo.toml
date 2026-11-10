@@ -1,19 +1,17 @@
 [package]
 name = "faceauth-gui"
-version = "0.1.0"
-edition = "2021"
+description = "GTK app for setting up FaceAuth face unlock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
-faceauth-core = { path = "../faceauth-core", features = ["vision"] }
-gtk4 = { version = "0.7", features = ["v4_10"] }
-libadwaita = "0.5"
-tokio = { version = "1.0", features = ["full"] }
-anyhow = "1.0"
-serde_json = "1.0"
+faceauth-core = { path = "../faceauth-core" }
+gtk4 = { version = "0.7", features = ["v4_12"] }
+libadwaita = { version = "0.5", features = ["v1_4"] }
 glib = "0.18"
-nokhwa = { version = "0.10", features = ["input-v4l", "output-wgpu"] }
-image = "0.25"
 cairo-rs = "0.18"
-ort = { version = "2.0.0-rc.9", features = ["ndarray"] }
-ndarray = "0.16"
-rusttype = "0.9"
+async-channel = "2.3"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+anyhow = "1.0"

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>FaceAuth</vendor>
+  <vendor_url>https://github.com/ibrahimgulbutt/faceauth</vendor_url>
+  <icon_name>org.faceauth.gui</icon_name>
+
+  <!--
+    Checked by faceauthd before it enrolls, adds samples to, or removes a
+    user's face data. auth_self asks for the user's own password every time.
+    Only local, active sessions may ask at all.
+  -->
+  <action id="org.faceauth.manage">
+    <description>Change face unlock data</description>
+    <message>Authentication is required to change your face unlock data</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+    <!--
+      faceauthd runs as the unprivileged "faceauth" user. Without this
+      annotation only root may check whether another user's process is
+      authorized for an action.
+    -->
+    <annotate key="org.freedesktop.policykit.owner">unix-user:faceauth</annotate>
+  </action>
+</policyconfig>

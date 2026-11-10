@@ -1,0 +1,64 @@
+# FaceAuth configuration — /etc/faceauth/config.toml
+#
+# Every key is optional; anything left out uses the default shown here.
+# Apply changes with:  sudo systemctl restart faceauth.service
+# Check them with:     faceauth doctor
+
+[camera]
+# "auto" picks the first colour camera (MJPEG, YUYV, NV12); "ir" picks the
+# first infrared camera, which works in the dark once its IR light is on.
+# A path selects a specific camera; stable paths under /dev/v4l/by-id/ survive
+# reboots and replugging. List cameras with:  faceauth cameras
+# Changing camera means setting up face unlock again.
+device = "auto"
+# device = "ir"
+# device = "/dev/v4l/by-id/usb-Integrated_Camera_IR-video-index0"
+
+# IR light commands ([[camera.ir_emitter]] entries) are added at the end of
+# this file by the installer, from what linux-enable-ir-emitter found. They are
+# only needed if the IR camera's light stays off, and only sent to an IR camera.
+# See "Infrared cameras" in the README, or run: faceauth ir-emitter
+
+# Frames discarded after a cold camera start while auto-exposure settles.
+# Warm starts (camera used in the last few minutes) discard fewer.
+warmup_frames = 8
+
+# Frames captured per authentication attempt. A majority must match.
+sequence_length = 5
+
+# Delay between captured frames, in milliseconds.
+sequence_interval_ms = 40
+
+[detection]
+# Minimum detector confidence (0–1) for something to count as a face.
+confidence_threshold = 0.5
+
+# Minimum face width in pixels. Smaller faces are too far away to recognize reliably.
+min_face_size = 80
+
+[recognition]
+# Cosine similarity (0–1) a frame needs to match your enrolled face.
+# Higher is stricter. Values below 0.45 make it easier for other people to pass.
+match_threshold = 0.55
+
+# Face recognizer (both from InsightFace, fetched by dist/fetch-models.sh):
+#   "accurate"  ResNet50: much better at telling similar faces apart, ~170 MB
+#   "fast"      MobileFaceNet: ~13 MB and about 5x quicker, noticeably less accurate
+# Changing this means everyone has to set up face unlock again.
+model = "accurate"
+
+# CPU threads for one recognition. 0 picks automatically: 1 for "fast", and
+# up to 4 (half your cores) for "accurate".
+threads = 0
+
+[security]
+# Reject frame sequences with no movement at all (a static image).
+# This is a basic check, not protection against photos held by hand or videos.
+require_liveness = true
+
+# Face-not-recognized attempts allowed before face unlock pauses.
+# Bad lighting or no face in view does not count.
+max_attempts = 3
+
+# How long face unlock stays paused after too many attempts. Your password always works.
+lockout_seconds = 60

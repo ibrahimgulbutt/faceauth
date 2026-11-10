@@ -1,151 +1,115 @@
-# FaceAuth System Architecture
+# FaceAuth architecture
 
-## 1. High-Level Logical Architecture
+This is an overview. The authoritative description of every flow, message and
+trust boundary is [docs/DESIGN.md](docs/DESIGN.md). Algorithms are covered in
+[TECHNICAL_DETAILS.md](TECHNICAL_DETAILS.md).
 
-FaceAuth is designed as a modular, secure, and non-intrusive authentication system. It separates the privileged authentication logic (PAM) from the complex computer vision processing (Daemon).
+## Components
 
 ```mermaid
 graph TD
-    User[User / Login Screen] -->|Triggers| PAM[PAM Module (pam_faceauth.so)]
-    PAM -->|IPC (Unix Socket)| Daemon[Daemon Service (faceauthd)]
-    
-    subgraph "Secure Context (faceauthd)"
-        Daemon -->|Capture| Camera[Camera Device]
-        Daemon -->|Inference| AI[AI Engine (ONNX Runtime)]
-        AI -->|Detect| DetModel[SCRFD Detection Model]
-        AI -->|Recognize| RecModel[ArcFace Recognition Model]
-        Daemon -->|Read/Decrypt| Storage[Encrypted Storage (AES-256)]
-    end
-    
-    Daemon -->|Auth Result| PAM
-    PAM -->|Allow/Deny| System[Linux Auth Stack]
+    App["sudo / GDM / SDDM / lock screen / polkit"] -->|PAM| PAM["pam_faceauth.so"]
+    GUI["Face Unlock app (faceauth-gui)"] -->|socket| Daemon
+    CLI["faceauth CLI"] -->|socket| Daemon
+    PAM -->|"/run/faceauth/faceauth.sock"| Daemon["faceauthd (user: faceauth, sandboxed)"]
+    Daemon -->|pkcheck| Polkit["polkit → password dialog"]
+    Daemon --> Camera["V4L2 camera"]
+    Daemon --> Models["ScrFD + ArcFace (ONNX Runtime)"]
+    Daemon --> Store["/var/lib/faceauth (AES-256-GCM)"]
 ```
 
-### Components
+| Component | Role |
+|---|---|
+| `pam_faceauth` | A small PAM module (`cdylib`). It asks the daemon whether the user is in front of the camera, shows short messages through the PAM conversation, and maps the outcome to a PAM result. It processes no images. It only trusts a daemon running as root or `faceauth`, and skips remote sessions. |
+| `faceauthd` | The only component that touches the camera, the models and the face data. It runs as the unprivileged `faceauth` system user in a strict systemd sandbox (`dist/faceauth.service`). Every caller is identified by `SO_PEERCRED`; enrollment changes are authorized through polkit. |
+| `faceauth-gui` | The **Face Unlock** app (GTK 4 + libadwaita). It shows status, runs enrollment and tests. It displays the preview the daemon streams and never opens the camera itself. |
+| `faceauth` (CLI) | Status, enrollment in the terminal, test, remove, list, cameras, doctor, benchmark. |
+| `faceauth-core` | The wire protocol (requests, responses, enrollment events) and framing shared by all of the above. |
 
-1.  **`pam_faceauth.so` (The Gatekeeper)**
-    *   **Role**: Integrates with the Linux PAM stack (`/etc/pam.d/sudo`, `/etc/pam.d/gdm-password`).
-    *   **Logic**: It is a lightweight C-compatible shared library. It does *not* process images. It simply asks the daemon "Is the user here?" and waits for a Yes/No response.
-    *   **Security**: Runs with the privileges of the calling process (e.g., root for sudo, gdm for login).
-
-2.  **`faceauthd` (The Brain)**
-    *   **Role**: The central background service that handles hardware and AI.
-    *   **Logic**:
-        *   Manages the camera (exclusive access).
-        *   Loads the AI models into memory.
-        *   Handles the secure storage decryption.
-        *   Performs the actual face matching.
-    *   **Security**: Runs as a systemd service (currently user-level, moving to system-level for login support). It isolates the complex/risky parsing of images and AI models from the critical PAM process.
-
-3.  **`faceauth-gui` (The Enrollment Tool)**
-    *   **Role**: User-facing application to register faces.
-    *   **Logic**: Provides a live video feed and visual feedback to help users capture high-quality reference images.
-
-4.  **`faceauth-cli` (The Admin Tool)**
-    *   **Role**: Diagnostics and management.
-    *   **Logic**: Used for `ping`, `doctor` (diagnostics), and listing enrolled users.
-
----
-
-## 2. Project File Structure
-
-The project is organized as a Rust Workspace, containing multiple crates (packages) that share dependencies.
+## Repository layout
 
 ```text
-FaceAuth/
-├── Cargo.toml                  # Workspace configuration
-├── install.sh                  # Installation & Setup script
-├── faceauth.service            # Systemd service definition
-├── README.md                   # Quick start guide
-├── TECHNICAL_DETAILS.md        # Deep dive into algorithms
-├── ARCHITECTURE.md             # This file
-│
-├── faceauth-core/              # [Shared Library]
-│   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs              # Shared types (AuthRequest, AuthResponse) and constants
-│
-├── faceauthd/                  # [Daemon Service]
-│   ├── Cargo.toml
-│   └── src/
-│       ├── main.rs             # Entry point, IPC loop
-│       ├── camera.rs           # Camera management (nokhwa)
-│       ├── detection.rs        # Face Detection logic (SCRFD)
-│       ├── recognition.rs      # Face Recognition logic (ArcFace)
-│       └── storage.rs          # Encrypted file handling (AES-GCM)
-│
-├── pam_faceauth/               # [PAM Module]
-│   ├── Cargo.toml              # Configured as "cdylib" (C-dynamic library)
-│   └── src/
-│       └── lib.rs              # Implements pam_sm_authenticate
-│
-├── faceauth-gui/               # [GUI Application]
-│   ├── Cargo.toml
-│   ├── models/                 # Local models for development
-│   └── src/
-│       ├── main.rs             # GTK4 UI setup
-│       └── detection.rs        # Local detection for UI feedback
-│
-├── faceauth-cli/               # [CLI Tool]
-│   ├── Cargo.toml
-│   └── src/
-│       └── main.rs             # Command line argument parsing
-│
-└── models/                     # [AI Models]
-    ├── arcface.onnx            # Face Recognition Model
-    └── det_500m.onnx           # Face Detection Model
+faceauth/
+├── Cargo.toml              # Workspace (shared version)
+├── install.sh              # Installer (curl | bash, or from a checkout)
+├── uninstall.sh            # Uninstaller (also installed to /usr/local/share/faceauth/)
+├── dist/
+│   ├── faceauth.service    # Sandboxed systemd unit (User=faceauth)
+│   ├── org.faceauth.manage.policy  # Polkit action for enrollment changes
+│   └── config.toml         # Default /etc/faceauth/config.toml
+├── docs/DESIGN.md          # Flows, protocol, trust boundaries
+├── assets/                 # App icon and .desktop file
+├── faceauth-core/src/lib.rs        # Protocol types, framing, username validation
+├── faceauthd/src/          # Daemon: server, authorization, polkit, camera,
+│                           # detection, recognition, enrollment, storage, config
+├── pam_faceauth/src/lib.rs # PAM entry points
+├── faceauth-cli/src/main.rs
+├── faceauth-gui/src/       # Face Unlock app
+└── models/                 # ONNX models for development (not in git)
 ```
 
----
+## Installed layout
 
-## 3. Data Flow & Logic
+| Path | Owner / mode | Purpose |
+|---|---|---|
+| `/usr/local/bin/faceauthd`, `faceauth`, `faceauth-gui` | root 0755 | Programs |
+| `<pam dir>/pam_faceauth.so` | root 0644 | PAM module (next to `pam_unix.so`) |
+| `/etc/systemd/system/faceauth.service` | root 0644 | Service unit |
+| `/usr/share/polkit-1/actions/org.faceauth.manage.policy` | root 0644 | Polkit action |
+| `/etc/faceauth/config.toml` | root 0644 | Configuration |
+| `/etc/faceauth/pam-services` | root 0644 | PAM files the installer changed |
+| `/usr/share/faceauth/models/` | root 0644 | ScrFD and ArcFace models |
+| `/var/lib/faceauth/` | faceauth 0700 | `master.key` and `<user>/models.enc` |
+| `/run/faceauth/faceauth.sock` | faceauth (dir 0755, socket 0666) | IPC |
 
-### Authentication Request
-1.  **Trigger**: User types `sudo ls`.
-2.  **PAM**: `pam_faceauth` initializes.
-3.  **Connect**: PAM connects to `/tmp/faceauth.sock`.
-4.  **Request**: Sends `AuthRequest::Authenticate { user: "ibrahim" }`.
-5.  **Daemon Action**:
-    *   Acquires Camera Lock & Starts Active Session.
-    *   **Parallel Execution**:
-        *   **Thread A**: Captures Frame 0 -> Sends to Detection -> Captures Frames 1-4.
-        *   **Thread B**: Runs `det_500m.onnx` on Frame 0 immediately.
-    *   **Detection**:
-        *   *If no face*: Returns `AuthResponse::Failure`.
-    *   **Crop**: Crops face from all frames (using Frame 0's box).
-    *   **Embedding**: Runs `arcface.onnx` on cropped faces -> `Vec<f32>`.
-    *   **Load**: Decrypts `~/.local/share/faceauth/ibrahim/models.enc`.
-    *   **Compare**: Calculates Cosine Similarity against all stored embeddings.
-6.  **Response**:
-    *   *Match (>0.6)*: Sends `AuthResponse::Success`.
-    *   *No Match*: Sends `AuthResponse::Failure`.
-7.  **Result**: PAM returns `PAM_SUCCESS` or `PAM_AUTH_ERR` to sudo.
+## Authentication at a glance
 
-### Enrollment Request (GUI)
-1.  **Trigger**: User opens `faceauth-gui`.
-2.  **Preview**: GUI accesses camera directly (or via daemon in future) to show preview.
-3.  **Capture**: GUI captures high-quality frames.
-4.  **Send**: GUI sends `AuthRequest::EnrollSample` with image data to daemon.
-5.  **Daemon Action**:
-    *   Generates embedding from sample.
-    *   Appends to user's encrypted profile.
-    *   Saves updated `models.enc`.
-6.  **Feedback**: Daemon confirms success.
+1. `sudo` calls `pam_sm_authenticate`. The module skips remote sessions,
+   connects to the socket and checks the peer is root or `faceauth`.
+2. It sends `Authenticate { user }`. Before touching the camera, the daemon
+   checks:
+   - the caller may act for that user;
+   - the user is enrolled with the current model;
+   - the user isn't locked out;
+   - no enrollment change for the user is being authorized;
+   - the camera is free.
+3. The daemon replies `Scanning` (the module shows "look at the camera…"). It
+   then captures frames, detects the largest face, aligns and embeds each
+   frame, and takes a majority vote.
+4. It replies `Auth(outcome)`. `Matched` becomes `PAM_SUCCESS`; anything else
+   falls through to the password.
 
----
+## Enrollment at a glance
 
-## 4. Security Architecture
+1. The app sends `Enroll { mode }`. The daemon resolves the user from the
+   peer's uid and asks polkit, with the client's pid, start time and uid. The
+   user's password dialog appears.
+2. The daemon opens the camera and streams `Frame` (mirrored JPEG preview plus
+   face box) and `Progress` (samples, wanted pose, hint) events.
+3. Each sample must pass the quality, pose, same-person and duplicate checks.
+4. Nothing is written until all samples are collected. The profile is then
+   replaced or appended to atomically, and `Completed` is sent. Closing the
+   connection cancels at any point.
 
-### Isolation
-*   **Privilege Separation**: The complex parsing of images (which can be an attack vector) happens in the daemon, not in the root-privileged PAM process.
-*   **Crash Safety**: If the daemon crashes, it does not crash the login screen (PAM simply falls back to password).
+## Security architecture
 
-### Data Protection
-*   **No Photos**: We do not store user photos. Only mathematical vectors.
-*   **Encryption**: All vectors are stored using **AES-256-GCM**.
-*   **Integrity**: The GCM mode ensures that if the storage file is tampered with, it will fail to decrypt rather than loading bad data.
-
-### Active Security Measures
-*   **Liveness Detection**: The daemon analyzes the frame sequence for natural motion (micro-movements) to reject static photos.
-*   **Rate Limiting**: After 3 failed attempts, the user is locked out of face authentication for 60 seconds to prevent brute-force attacks.
-*   **Audit Logging**: All authentication attempts (success/fail) are logged to the system journal with scores and liveness results.
+- **Least privilege.** The daemon has no capabilities, sees a read-only system
+  and no home directories, has no network, and can only open video devices. A
+  bug in image or model parsing is contained to `/var/lib/faceauth` and
+  `/run/faceauth`.
+- **Kernel-verified identity.** `SO_PEERCRED` on both sides of the socket:
+  - the daemon authorizes callers by uid;
+  - the PAM module authenticates the daemon by uid.
+- **Password-gated changes.** Polkit `auth_self` gates every enrollment change.
+  Face authentication for that user is refused while the check runs.
+- **Fail closed.** A missing model, invalid config, corrupt key or degenerate
+  embedding stops the operation. Errors in PAM fall through to the password.
+- **No photos at rest.** Only embeddings are stored, with AES-256-GCM. Each
+  profile records the recognition model's ID so a model change can't silently
+  break or weaken matching.
+- **Honest liveness.** The frame-difference check rejects static images only.
+  RGB spoofing is a documented limitation (see README).
+- **Rate limiting.** After `max_attempts` not-recognized attempts, face unlock
+  pauses for `lockout_seconds`. Bad lighting and empty frames don't count.
+- **Audit log.** Every attempt, enrollment, removal and denied request is
+  logged to the journal (`journalctl -u faceauth.service`).

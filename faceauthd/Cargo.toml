@@ -1,26 +1,26 @@
 [package]
 name = "faceauthd"
-version = "0.1.0"
-edition = "2021"
+description = "FaceAuth daemon: camera, face detection and recognition"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 faceauth-core = { path = "../faceauth-core" }
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process", "signal"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.10"
-nokhwa = { version = "0.10", features = ["input-v4l", "output-threaded"] }
-image = "0.25"
+nokhwa = { version = "0.10", features = ["input-v4l"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 ort = { version = "2.0.0-rc.9", features = ["download-binaries"] }
 ndarray = "0.16"
 aes-gcm = "0.10"
 rand = "0.8"
-dirs = "5.0"
 sha2 = "0.10"
-base64 = "0.22"
-futures = "0.3.31"
 toml = "0.9.10"
-
-
+libc = "0.2"
+v4l = "0.14"

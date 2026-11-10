@@ -1,159 +1,180 @@
-# FaceAuth Technical Deep Dive
+# FaceAuth technical details
 
-This document provides a comprehensive technical explanation of the algorithms, libraries, and procedures used in the FaceAuth system.
+How FaceAuth turns camera frames into an unlock decision. For flows, messages
+and trust boundaries see [docs/DESIGN.md](docs/DESIGN.md); for the component
+overview see [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## 1. Core Technologies & Libraries
+## Libraries
 
-The system is built in **Rust** to ensure memory safety and high performance. The following key libraries (crates) are used:
+| Crate | Used for |
+|---|---|
+| `ort` (ONNX Runtime) | Running the detection and recognition models |
+| `nokhwa` | V4L2 colour capture (MJPEG, YUYV, NV12) |
+| `v4l` | Device probing, greyscale (IR) capture, the IR emitter control |
+| `image`, `ndarray` | Image manipulation, tensors, JPEG preview encoding |
+| `aes-gcm`, `sha2` | Encrypted profiles; model IDs |
+| `tokio` | The daemon's socket server and request streaming |
+| `serde`, `serde_json` | Protocol messages and stored profiles |
+| `gtk4`, `libadwaita`, `cairo-rs` | The Face Unlock app |
 
-*   **`ort` (ONNX Runtime)**: The core inference engine. It runs the pre-trained AI models. We use the `ndarray` feature to handle tensor inputs/outputs efficiently.
-    *   *Update (Phase 6)*: Models are now quantized to **INT8** for 30-40% faster inference on CPUs.
-*   **`nokhwa`**: A cross-platform camera library used to capture raw frames from Video4Linux2 (V4L2) or Libcamera devices.
-*   **`image`**: Used for image manipulation (resizing, cropping, pixel access).
-*   **`ndarray`**: Provides N-dimensional array structures (tensors) required by the ONNX models.
-*   **`aes-gcm`**: Implements the AES-256-GCM authenticated encryption standard for securing user data.
-*   **`tokio`**: An asynchronous runtime that allows the daemon to handle IPC requests, camera operations, and **parallel recognition tasks** concurrently.
-*   **`serde` / `serde_json`**: Handles serialization of IPC messages and storage files.
+## Pipeline
 
----
+**Capture → Detect → Align → Embed → Compare → Vote**
 
-## 2. Computer Vision Pipeline
+### 1. Capture
 
-The authentication process follows a strict pipeline: **Capture → Detect → Align → Recognize → Compare**.
+- **Camera choice.** `camera.device = "auto"` picks the first device with a
+  colour format, `"ir"` the first infrared one (UVC interface or device name
+  says IR, or greyscale only); a path selects one explicitly. Devices are
+  probed with `v4l`. Greyscale streams are read with `v4l` directly, because
+  nokhwa 0.10 asks V4L2 for the FourCC `GRAY` instead of `GREY` and can't open
+  them.
+- **Format choice, in order:**
+  1. MJPEG closest to 1280×720;
+  2. YUYV closest to 640×480;
+  3. GREY closest to 640×480;
+  4. anything else.
 
-### Step 1: Image Acquisition & Overlapped Processing (Phase 7A)
-*   **Source**: The system connects to `/dev/video0` (or the first available camera).
-*   **Active Session**: An `ActiveCamera` session is established to maintain the stream, reducing initialization overhead.
-*   **Overlapped Strategy**:
-    1.  **Frame 0 Capture**: The first frame is captured immediately after a short warmup (2 frames).
-    2.  **Parallel Fork**:
-        *   **Path A (Detection)**: Frame 0 is sent immediately to the AI thread for Face Detection.
-        *   **Path B (Capture)**: The camera continues to capture Frames 1-4 concurrently.
-    3.  **Synchronization**: The system awaits the completion of both paths. This effectively hides the detection latency (~120ms) behind the physical capture time of the remaining frames.
-*   **Format**: Frames are captured in RGB format at 1280x720.
+  GREY (infrared) frames are expanded to three channels.
+- **IR emitter.** Each `[[camera.ir_emitter]]` UVC extension-unit control
+  (`UVCIOC_CTRL_QUERY`, `UVC_SET_CUR`) is sent in order each time an infrared
+  stream starts, never to a colour stream. The installer fills them in from
+  linux-enable-ir-emitter's `~/.config/linux-enable-ir-emitter.toml`, matching
+  its device keys (`usb-VID:PID[-serial]-ifN-indexN` from sysfs, or a path) to
+  connected cameras.
+- **Exposure.** After the warm-up, while the picture is dark (mean < 70) and
+  still getting brighter, up to 15 more frames are read so auto-exposure can
+  catch up.
+- **Flashing emitters.** For IR, the brightness of six frames is checked; if it
+  alternates bright/dark, dark frames are skipped from then on.
+- **Adaptive warm-up.** The daemon remembers when the camera was last closed,
+  using wall-clock time so a suspend counts as idle:
 
-### Step 2: Face Detection (The "Finder")
-Before recognizing *who* someone is, we must confirm *if* someone is there.
-*   **Algorithm**: **SCRFD** (Sample and Computation Redistribution for Face Detection).
-*   **Model File**: `det_500m_int8.onnx` (Quantized INT8 version).
-*   **Input**: The camera frame is resized to **640x640** pixels.
-*   **Normalization**: Pixel values are normalized to the range `[-1.0, 1.0]` using `(pixel - 127.5) / 128.0`.
-*   **Adaptive Strategy (Phase 6 & 7A)**:
-    *   **Frame 0**: Full detection runs on Frame 0 *while* Frames 1-4 are being captured.
-    *   **Frames 1-4**: Detection is skipped. We use the cached bounding box from Frame 0 (center-cropped) to save ~400ms of processing time.
-*   **Output**: The model outputs "score maps" and "bounding box maps".
-*   **Logic**:
-    1.  We scan the score map for values > **0.5** (50% confidence).
-    2.  If no face is found, the process aborts immediately (Security feature: prevents background false positives).
-    3.  If a face is found, we calculate the bounding box coordinates.
+  | Idle time | Settle delay | Warm-up frames |
+  |---|---|---|
+  | < 30 s | 0 ms | 2 |
+  | 30 s – 5 min | 100 ms | 4 |
+  | longer | 300 ms | `warmup_frames` |
 
-### Step 3: Preprocessing & Alignment
-*   **Cropping**: The system crops the original image to the detected bounding box.
-*   **Resizing**: The cropped face is resized to **112x112** pixels, which is the required input size for the recognition model.
-*   **Normalization**: The 112x112 image is normalized again to `[-1.0, 1.0]`.
+- **Overlap.** Frame 0 goes to detection while frames 1–N are captured, every
+  `sequence_interval_ms`.
+- **Brightness guard.** A frame whose mean brightness is outside a usable range
+  ends the attempt as `BadLighting`.
+- **Low light.** Frames darker than mean 60 are gamma-brightened before
+  detection, and aligned faces darker than 70 before recognition (the same at
+  setup and login). Gamma lifts dark detail towards a mean of 110 and leaves
+  normally lit images untouched.
 
-### Step 4: Feature Extraction (The "Recognizer")
-This step converts a face image into a unique mathematical "fingerprint".
-*   **Algorithm**: **ArcFace** (Additive Angular Margin Loss).
-*   **Backbone Architecture**: **MobileFaceNet** (Optimized for mobile/CPU performance).
-*   **Model File**: `arcface_int8.onnx` (Quantized INT8 version).
-*   **Input**: A 112x112 RGB tensor `(1, 3, 112, 112)`.
-*   **Output**: A **512-dimensional floating-point vector** (Embedding).
-*   **Properties**: This vector represents the facial features. Two images of the same person will produce vectors that point in roughly the same direction in 512-dimensional space.
-*   **Optimization**: Image normalization is accelerated using LLVM auto-vectorization (SIMD) instead of external crates.
+### 2. Detection: SCRFD-500MF (`det_500m.onnx`, from InsightFace `buffalo_sc`)
 
-### Step 5: Comparison (Matching)
-*   **Metric**: **Cosine Similarity**.
-*   **Formula**: $Similarity = A \cdot B$ (Dot product of two normalized vectors).
-*   **Threshold**: **0.6**.
-    *   Score > 0.6: Match Confirmed.
-    *   Score < 0.6: Match Failed.
+- **Input.** The frame is letterboxed into 640×640: scaled to fit while keeping
+  its aspect ratio, then padded. It is normalised with `(p − 127.5) / 128`.
+  Earlier versions squashed the frame, which distorted faces and landmarks.
+- **Decoding.** Outputs at strides 8, 16 and 32 give scores, distance-encoded
+  boxes and 5 landmarks per anchor (2 anchors per grid cell). Anchors above
+  `detection.confidence_threshold` are decoded, mapped back to frame
+  coordinates and merged with non-maximum suppression.
+- **Selection.** The **largest** face is used, among those scoring close to the
+  best one. Someone farther in the background can't be picked over the person
+  in front.
 
----
+### 3. Alignment
 
-## 3. Data Storage & Security Procedure
+A 4-DOF similarity transform (closed-form Umeyama least squares) maps the five
+landmarks (eyes, nose tip, mouth corners) onto ArcFace's canonical 112×112
+positions. The frame is then warped with bilinear sampling. ArcFace was trained
+only on faces aligned this way; without it, similarity scores collapse when
+distance or head angle changes. Frames 1–N reuse frame 0's landmarks, because
+the face barely moves within ~200 ms.
 
-FaceAuth **never stores actual photos** of your face on the disk. It only stores the mathematical embeddings.
+### 4. Embedding: ResNet50 or MobileFaceNet
 
-### Storage Location
-*   Path: `~/.local/share/faceauth/<username>/models.enc`
+`recognition.model` selects the recognizer; both were trained by InsightFace
+with ArcFace loss on WebFace600K and produce 512-dimensional embeddings:
 
-### Encryption Standard
-*   **Algorithm**: **AES-256-GCM** (Galois/Counter Mode).
-*   **Key Generation**: A 256-bit master key is generated on first run and stored in `~/.local/share/faceauth/master.key` (Note: In a production enterprise environment, this should be stored in the TPM).
-*   **Nonce**: A unique 96-bit random nonce is generated for every save operation.
+| `model` | File | Source | Threads (`threads = 0`) |
+|---|---|---|---|
+| `accurate` (default) | `arcface_r50.onnx` | `buffalo_l/w600k_r50.onnx` | half the cores, at most 4 |
+| `fast` | `arcface.onnx` | `buffalo_sc/w600k_mbf.onnx` | 1 |
 
-### File Structure (`models.enc`)
-The file is binary and follows this layout:
-1.  **Nonce (12 bytes)**: The random initialization vector used for encryption.
-2.  **Ciphertext (Variable)**: The encrypted JSON data.
-    *   *Decrypted Content*: A JSON object containing:
-        *   `user`: Username.
-        *   `embeddings`: A list of 512-float vectors (one for each enrolled angle).
-        *   `last_updated`: Timestamp.
+The aligned RGB crop is normalised with `(p − 127.5) / 127.5` and the output is
+L2-normalised. A zero or non-finite vector is an error, never a match. Frame 0
+is detected and embedded on a second thread while the camera is still
+capturing frames 1–4. Legacy `*_int8.onnx` files from versions before 1.0 are
+only used when the original file is absent.
 
-### Why this is secure?
-1.  **No Images**: Even if an attacker decrypts the file, they cannot reconstruct your face photo from the 512 numbers (it is a one-way abstraction).
-2.  **Tamper Proof**: AES-GCM provides integrity checking. If someone modifies the file, decryption will fail immediately.
+### 5. Comparison and vote
 
----
+- **Similarity.** Cosine similarity (a dot product of unit vectors) between a
+  frame's embedding and every stored sample; the best score counts for that
+  frame. Vectors of different lengths never match.
+- **Vote.** A frame matches when its best score exceeds
+  `recognition.match_threshold` (default 0.55). The attempt succeeds when a
+  majority of `sequence_length` frames match.
+- **Liveness.** With `require_liveness`, the mean absolute difference between
+  consecutive frames must fall within a range typical of a live scene. This
+  rejects perfectly static images only.
 
-## 4. Full Authentication Flow
+### 6. Rate limiting
 
-When you run `sudo` or try to log in:
+Per user, in memory. After `max_attempts` attempts that end in `NotMatched` or
+`NotLive`, face unlock answers `LockedOut` for `lockout_seconds`. `NoFace` and
+`BadLighting` don't count.
 
-1.  **PAM Trigger**: The `pam_faceauth.so` module is loaded by the system.
-2.  **IPC Request**: PAM sends an `AUTH_REQUEST` to the `faceauthd` daemon via a Unix socket.
-3.  **Daemon Wakeup**:
-    *   The daemon wakes up the camera.
-    *   It captures a frame.
-4.  **AI Inference**:
-    *   **Detector**: Is there a face? (Frame 0 only).
-    *   **Parallel Recognition**: The daemon spawns parallel threads to process all 5 frames simultaneously.
-    *   **Recognizer**: Get the 512-vector for the detected face.
-5.  **Matching**:
-    *   The daemon decrypts your stored `models.enc`.
-    *   It compares the live vector against *all* your enrolled vectors.
-    *   It finds the highest similarity score.
-6.  **Decision**:
-    *   If Score > 0.6: Daemon sends `AUTH_SUCCESS`. PAM allows login.
-    *   If Score < 0.6: Daemon sends `AUTH_FAIL`. PAM asks for password.
+## Enrollment
 
----
+Enrollment runs entirely in the daemon. The full flow is in
+[DESIGN.md](docs/DESIGN.md#flow-enrollment).
 
-## 5. Advanced Features
+- **Steps.** "Set up" captures 10 samples: Center ×2, Left ×2, Right ×2,
+  Up ×2, Down ×2. "Improve" captures 6.
+- **Head pose** comes from the landmarks:
+  - **yaw** = horizontal nose offset from the eye midpoint ÷ eye distance;
+  - **pitch** = where the nose sits between the eye line and the mouth line.
 
-### Liveness Detection
-To prevent spoofing with static photos, the system analyzes the sequence of 5 frames captured during authentication.
-*   **Method**: Frame Difference Analysis.
-*   **Logic**: We calculate the average pixel difference between consecutive frames.
-    *   **Static (< 0.005)**: Rejected (Likely a photo).
-    *   **Natural (0.005 - 0.15)**: Accepted (Natural head movement/noise).
-    *   **Chaotic (> 0.15)**: Rejected (Excessive motion or lighting changes).
+  Both are relative to the user's first frontal sample. A step's pose
+  requirement is relaxed after 6 s.
+- **A sample is accepted only when:**
+  - there is exactly one face;
+  - it is at least `min_face_size` px wide;
+  - face brightness is 28–215 (dim faces are brightened; below 28 an IR camera
+    reports that its light seems off);
+  - the pose matches;
+  - similarity is ≥ 0.40 to the samples already collected (same person);
+  - similarity is ≤ 0.92 to each of them (not a duplicate);
+  - at least 350 ms have passed since the previous sample.
+- **Preview.** Every frame is sent to the client mirrored, as a JPEG, with the
+  face box normalised to 0–1.
+- **Commit.** The profile is written atomically at the end, never during
+  capture. A profile holds at most 40 samples.
 
-### Rate Limiting
-To prevent brute-force attacks on the model:
-*   **Algorithm**: Token Bucket / Lockout.
-*   **Policy**: 3 failed attempts trigger a 60-second lockout for that user.
-*   **Implementation**: In-memory tracking within the daemon.
+## Storage
 
-### Configuration
-The system is configurable via `/etc/faceauth/config.toml`:
-```toml
-[detection]
-confidence_threshold = 0.4
-min_face_size = 64
+Path: `/var/lib/faceauth/<user>/models.enc`, owned by `faceauth`, mode 0600.
 
-[recognition]
-match_threshold = 0.40
-strong_match_threshold = 0.55
+| Item | Format |
+|---|---|
+| `master.key` | 32 random bytes, mode 0600, created on first start |
+| `models.enc` | 12-byte random nonce followed by AES-256-GCM ciphertext |
+| Plaintext | JSON: `user`, `embeddings` (lists of 512 floats), `model_id`, `created`, `updated` |
 
-[camera]
-warmup_frames = 10
-sequence_length = 5
+- **Model ID.** `model_id` is the first 16 hex characters of the SHA-256 of the
+  recognition model file. A profile whose ID differs from the installed model is
+  reported as `ModelChanged`, as is a profile made with the other kind of
+  camera (the profile records `infrared`). Profiles from before 1.0 have no ID; they were
+  made with the old INT8 MobileFaceNet file, which is no longer installed, so
+  they are reported as `ModelChanged` too.
+- **What the encryption protects.** GCM authenticates the ciphertext, so a
+  modified file fails to decrypt instead of loading altered data. The key lives
+  on the same disk, so this protects a copied profile file. It does not protect
+  against someone with root or with the whole unencrypted disk.
 
-[security]
-require_liveness = true
-max_attempts = 3
-lockout_seconds = 60
-```
+## Configuration
+
+`/etc/faceauth/config.toml`. All keys are optional; see
+[dist/config.toml](dist/config.toml) for the commented defaults. Invalid values
+stop the daemon with a clear error rather than weakening matching:
+
+- `match_threshold` outside (0, 1];
+- `sequence_length` of 0, or below 2 when liveness is enabled;
+- `max_attempts` of 0.
