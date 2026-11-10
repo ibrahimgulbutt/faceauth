@@ -28,14 +28,29 @@ pub struct CameraConfig {
     pub warmup_frames: usize,
     pub sequence_length: usize,
     pub sequence_interval_ms: u64,
-    /// Vendor command that switches on an IR camera's emitter, sent each time
-    /// the stream starts. Only needed when the IR light stays off.
-    pub ir_emitter: Option<IrEmitter>,
+    /// Vendor commands that switch on an IR camera's emitter, sent in order
+    /// each time the stream starts. Only needed when the IR light stays off.
+    /// Accepts one `[camera.ir_emitter]` table or several `[[camera.ir_emitter]]`.
+    #[serde(deserialize_with = "one_or_many")]
+    pub ir_emitter: Vec<IrEmitter>,
+}
+
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<IrEmitter>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(IrEmitter),
+        Many(Vec<IrEmitter>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(e) => vec![e],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 impl Default for CameraConfig {
     fn default() -> Self {
-        Self { device: "auto".into(), warmup_frames: 8, sequence_length: 5, sequence_interval_ms: 40, ir_emitter: None }
+        Self { device: "auto".into(), warmup_frames: 8, sequence_length: 5, sequence_interval_ms: 40, ir_emitter: Vec::new() }
     }
 }
 
@@ -193,10 +208,11 @@ impl Config {
         if self.camera.warmup_frames > 60 {
             anyhow::bail!("camera.warmup_frames must be at most 60");
         }
-        if let Some(e) = &self.camera.ir_emitter {
-            if e.control.is_empty() || e.control.len() > 64 {
-                anyhow::bail!("camera.ir_emitter.control must have 1 to 64 bytes");
-            }
+        if self.camera.ir_emitter.len() > 16 {
+            anyhow::bail!("camera.ir_emitter can have at most 16 controls");
+        }
+        if self.camera.ir_emitter.iter().any(|e| e.control.is_empty() || e.control.len() > 64) {
+            anyhow::bail!("camera.ir_emitter.control must have 1 to 64 bytes");
         }
         if self.recognition.threads > 16 {
             anyhow::bail!("recognition.threads must be between 0 (automatic) and 16");
@@ -265,8 +281,16 @@ mod tests {
         )
         .unwrap();
         cfg.validate().unwrap();
-        let e = cfg.camera.ir_emitter.unwrap();
+        let e = &cfg.camera.ir_emitter[0];
         assert_eq!((e.unit, e.selector, e.control.len()), (14, 6, 9));
+        // linux-enable-ir-emitter can need several controls.
+        let many: Config = toml::from_str(
+            "[[camera.ir_emitter]]\nunit = 4\nselector = 2\ncontrol = [1]\n\
+             [[camera.ir_emitter]]\nunit = 7\nselector = 5\ncontrol = [3, 0]\n",
+        )
+        .unwrap();
+        many.validate().unwrap();
+        assert_eq!(many.camera.ir_emitter.len(), 2);
         let empty: Config = toml::from_str("[camera.ir_emitter]\nunit = 1\nselector = 1\ncontrol = []\n").unwrap();
         assert!(empty.validate().is_err());
     }

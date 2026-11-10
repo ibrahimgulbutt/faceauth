@@ -1,5 +1,6 @@
 //! `faceauth` — command-line front end for faceauthd.
 
+mod ir_emitter;
 mod polkit_agent;
 mod term;
 
@@ -67,6 +68,15 @@ enum Command {
     Doctor,
     /// Measure how long each stage of recognition takes
     Benchmark,
+    /// Show the IR-light settings saved by linux-enable-ir-emitter
+    IrEmitter {
+        /// linux-enable-ir-emitter configuration (default: ~/.config/linux-enable-ir-emitter.toml)
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Print only the lines for /etc/faceauth/config.toml (for scripts)
+        #[arg(long)]
+        toml: bool,
+    },
     /// Print client and daemon versions
     Version,
     /// Exit 0 if the daemon answers (for scripts)
@@ -84,6 +94,7 @@ fn main() -> ExitCode {
         Command::Cameras => cameras(),
         Command::Doctor => doctor(),
         Command::Benchmark => benchmark(),
+        Command::IrEmitter { file, toml } => ir_emitter_cmd(file, toml),
         Command::Version => version(),
         Command::Ping => return if ping().is_ok() { ExitCode::SUCCESS } else { ExitCode::FAILURE },
     };
@@ -331,6 +342,49 @@ fn benchmark() -> Result<ExitCode> {
     }
 }
 
+fn ir_emitter_cmd(file: Option<std::path::PathBuf>, toml_only: bool) -> Result<ExitCode> {
+    let Some(file) = file.or_else(ir_emitter::tool_config_path) else { bail!("HOME is not set; pass --file") };
+    if !file.exists() {
+        if !toml_only {
+            println!("No linux-enable-ir-emitter settings at {}.", file.display());
+            println!();
+            println!("Only needed if your infrared camera's light stays off (see \"Infrared cameras\" in");
+            println!("the README). To find the command that switches it on:");
+            println!("  1. Install linux-enable-ir-emitter: https://github.com/EmixamPP/linux-enable-ir-emitter");
+            println!("  2. Run, as yourself (not with sudo):  linux-enable-ir-emitter configure");
+            println!("  3. Re-run the FaceAuth installer; it picks up the result.");
+        }
+        return Ok(ExitCode::FAILURE);
+    }
+    let found = ir_emitter::find(&file)?;
+    let Some(found) = found else {
+        if !toml_only {
+            println!("{} has no saved settings for a camera connected now.", file.display());
+            println!("Run linux-enable-ir-emitter configure (as yourself, not with sudo) and pick your IR camera.");
+        }
+        return Ok(ExitCode::FAILURE);
+    };
+    let snippet = ir_emitter::to_toml(&found.controls);
+    if toml_only {
+        print!("{snippet}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("IR light settings from {}:", file.display());
+    println!("  Camera    {}{}", found.node.display(), if found.infrared { " (infrared)" } else { "" });
+    println!("  Commands  {}", found.controls.len());
+    println!();
+    match ir_emitter::configured_in(std::path::Path::new("/etc/faceauth/config.toml")) {
+        Some(n) if n > 0 => println!("FaceAuth's config already has {n} IR emitter command(s)."),
+        _ => {
+            println!("To use them, re-run the FaceAuth installer and choose the infrared camera,");
+            println!("or add these lines to /etc/faceauth/config.toml and run: sudo systemctl restart faceauth");
+            println!();
+            print!("{snippet}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn version() -> Result<ExitCode> {
     println!("faceauth   {VERSION} (protocol {PROTOCOL_VERSION})");
     match ping() {
@@ -392,6 +446,15 @@ fn doctor() -> Result<ExitCode> {
     }
     let policy = std::path::Path::new("/usr/share/polkit-1/actions/org.faceauth.manage.policy");
     check(Some(policy.exists()), "Polkit policy", if policy.exists() { "installed".into() } else { format!("{} missing — setup cannot ask for your password", policy.display()) });
+    if ir_emitter::has_ir_camera() {
+        let tool = ir_emitter::tool_config_path().filter(|p| p.exists());
+        let saved = tool.as_deref().and_then(|p| ir_emitter::find(p).ok().flatten());
+        match ir_emitter::configured_in(std::path::Path::new("/etc/faceauth/config.toml")) {
+            Some(n) if n > 0 => check(Some(true), "IR light", format!("FaceAuth switches it on ({n} command(s))")),
+            _ if saved.is_some() => check(None, "IR light", "linux-enable-ir-emitter settings found but not used — see: faceauth ir-emitter".into()),
+            _ => check(None, "IR light", "not set up (only needed to use the IR camera in the dark) — see: faceauth ir-emitter".into()),
+        }
+    }
     let config = std::path::Path::new("/etc/faceauth/config.toml");
     check(if config.exists() { Some(true) } else { None }, "Config", if config.exists() { config.display().to_string() } else { "not found, using defaults".into() });
 

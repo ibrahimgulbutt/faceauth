@@ -36,8 +36,12 @@ overview see [ARCHITECTURE.md](ARCHITECTURE.md).
   4. anything else.
 
   GREY (infrared) frames are expanded to three channels.
-- **IR emitter.** If `camera.ir_emitter` is set, its UVC extension-unit control
-  (`UVCIOC_CTRL_QUERY`, `UVC_SET_CUR`) is sent each time the stream starts.
+- **IR emitter.** Each `[[camera.ir_emitter]]` UVC extension-unit control
+  (`UVCIOC_CTRL_QUERY`, `UVC_SET_CUR`) is sent in order each time an infrared
+  stream starts, never to a colour stream. The installer fills them in from
+  linux-enable-ir-emitter's `~/.config/linux-enable-ir-emitter.toml`, matching
+  its device keys (`usb-VID:PID[-serial]-ifN-indexN` from sysfs, or a path) to
+  connected cameras.
 - **Exposure.** After the warm-up, while the picture is dark (mean < 70) and
   still getting brighter, up to 15 more frames are read so auto-exposure can
   catch up.

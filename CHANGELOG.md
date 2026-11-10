@@ -120,6 +120,12 @@ privilege-escalation bugs; upgrade, and set up face unlock again afterwards.
   waiting forever.
 - `faceauth benchmark` reports the face brightness and warns when an IR
   camera's light seems to be off.
+- **IR light settings are imported.** When the infrared camera is chosen, the
+  installer reads what linux-enable-ir-emitter (v7) saved for that camera and
+  writes it to `[[camera.ir_emitter]]` (several commands supported). FaceAuth
+  then switches the light on itself every time, and only ever sends these
+  commands to an infrared stream. `faceauth ir-emitter` shows the saved
+  settings; `faceauth doctor` reports whether the light is being switched on.
 - **Face data from before 1.0 is paused, not compared.** It was made with the old INT8 model, so face unlock reports that it needs setting up again (in sudo, `faceauth status` and the app) instead of failing the match and counting toward lockout.
 
 - **Better detection.**

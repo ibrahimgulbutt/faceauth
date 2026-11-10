@@ -14,13 +14,10 @@ device = "auto"
 # device = "ir"
 # device = "/dev/v4l/by-id/usb-Integrated_Camera_IR-video-index0"
 
-# Only if your IR camera's light stays off: the vendor command that switches
-# it on, sent every time the camera starts. Get the values from
-# linux-enable-ir-emitter (see "Infrared cameras" in the README).
-# [camera.ir_emitter]          (example values; yours will differ)
-# unit = 14
-# selector = 6
-# control = [1, 3, 3, 0, 0, 0, 0, 0, 0]
+# IR light commands ([[camera.ir_emitter]] entries) are added at the end of
+# this file by the installer, from what linux-enable-ir-emitter found. They are
+# only needed if the IR camera's light stays off, and only sent to an IR camera.
+# See "Infrared cameras" in the README, or run: faceauth ir-emitter
 
 # Frames discarded after a cold camera start while auto-exposure settles.
 # Warm starts (camera used in the last few minutes) discard fewer.

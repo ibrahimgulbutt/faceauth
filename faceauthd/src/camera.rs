@@ -18,7 +18,7 @@ use crate::config::IrEmitter;
 use anyhow::{bail, Context, Result};
 use faceauth_core::CameraDevice;
 use image::{GrayImage, RgbImage};
-use log::{info, warn};
+use log::{debug, info, warn};
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution};
 use nokhwa::Camera;
@@ -49,11 +49,11 @@ pub struct CameraManager {
     /// because CLOCK_MONOTONIC does not advance during suspend, and a long
     /// sleep is exactly when the sensor needs a longer warm-up.
     last_closed: Mutex<Option<SystemTime>>,
-    emitter: Option<IrEmitter>,
+    emitter: Vec<IrEmitter>,
 }
 
 impl CameraManager {
-    pub fn new(device: &str, emitter: Option<IrEmitter>) -> Result<Self> {
+    pub fn new(device: &str, emitter: Vec<IrEmitter>) -> Result<Self> {
         let device = device.trim();
         let selection = if device.eq_ignore_ascii_case("auto") {
             Selection::Auto
@@ -138,15 +138,22 @@ impl CameraManager {
             fmt.frame_rate(),
             if idle_secs == u64::MAX { "∞".to_string() } else { format!("{idle_secs}s") },
         );
-        if let (Some(emitter), Some((index, _))) = (&self.emitter, *self.resolved.lock().unwrap_or_else(|p| p.into_inner())) {
-            if let Err(e) = enable_emitter(index, emitter) {
-                warn!("Could not switch on the IR emitter: {e:#}");
+        // Vendor commands are only ever sent to an infrared stream: on a combined
+        // module the colour half may expose the same units with other meanings.
+        let infrared = fmt.format() == FrameFormat::GRAY;
+        if !infrared && !self.emitter.is_empty() {
+            debug!("Not sending camera.ir_emitter: the camera in use is not infrared");
+        }
+        if let (true, Some((index, _))) = (infrared, *self.resolved.lock().unwrap_or_else(|p| p.into_inner())) {
+            for emitter in &self.emitter {
+                if let Err(e) = enable_emitter(index, emitter) {
+                    warn!("Could not switch on the IR emitter: {e:#}");
+                }
             }
         }
         if settle_ms > 0 {
             std::thread::sleep(Duration::from_millis(settle_ms));
         }
-        let infrared = fmt.format() == FrameFormat::GRAY;
         let mut active = ActiveCamera { backend, manager: self, strobe: None };
         for _ in 0..warmup {
             active.backend.skip_frame();

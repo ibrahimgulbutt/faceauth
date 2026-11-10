@@ -505,6 +505,8 @@ dependencies = [
  "clap",
  "faceauth-core",
  "libc",
+ "serde",
+ "toml 0.9.10+spec-1.1.0",
 ]
 
 [[package]]

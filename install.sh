@@ -449,6 +449,39 @@ if [ -n "$CAMERA_CHOICE" ] && [ "$CAMERA_CHOICE" != "${CURRENT_CAMERA:-auto}" ];
     ok "Camera set to '$CAMERA_CHOICE' (face data made with the other camera has to be set up again)"
 fi
 
+# set_ir_emitter TOML — replace any [camera.ir_emitter] / [[camera.ir_emitter]]
+# blocks with TOML (as printed by `faceauth ir-emitter --toml`).
+IR_MARKER="# IR light commands imported from linux-enable-ir-emitter by the installer."
+set_ir_emitter() {
+    local cfg="$CONFIG_DIR/config.toml" tmp
+    tmp=$(mktemp)
+    sudo cat "$cfg" | awk -v marker="$IR_MARKER" '
+        $0 == marker { next }
+        /^[[:space:]]*\[/ { skip = ($0 ~ /^[[:space:]]*\[\[?[[:space:]]*camera\.ir_emitter[[:space:]]*\]/) }
+        skip { next }
+        /^[[:space:]]*$/ { blanks++; next }
+        { while (blanks > 0) { print ""; blanks-- }; print }
+    ' >"$tmp"
+    printf '\n%s\n%s\n' "$IR_MARKER" "$1" >>"$tmp"
+    sudo install -m 644 "$tmp" "$cfg"
+    rm -f "$tmp"
+}
+
+# Infrared camera: switch its light on with the commands linux-enable-ir-emitter
+# found (it saves them in the user's home, which is why this runs as the user).
+if [ "${CAMERA_CHOICE:-${CURRENT_CAMERA:-auto}}" = "ir" ]; then
+    if EMITTER_TOML=$("$PREFIX/bin/faceauth" ir-emitter --toml 2>/dev/null) && [ -n "$EMITTER_TOML" ]; then
+        set_ir_emitter "$EMITTER_TOML"
+        ok "IR light: using the settings saved by linux-enable-ir-emitter"
+    elif sudo grep -Eq '^[[:space:]]*\[\[?[[:space:]]*camera\.ir_emitter' "$CONFIG_DIR/config.toml"; then
+        ok "IR light: keeping the settings already in $CONFIG_DIR/config.toml"
+    else
+        info "IR light: if face unlock fails in the dark, the camera's infrared light is off."
+        info "  Run 'linux-enable-ir-emitter configure' as yourself, then re-run this installer."
+        info "  Details: faceauth ir-emitter, and \"Infrared cameras\" in the README."
+    fi
+fi
+
 # Versions before 1.0 kept face data in root's home directory.
 if sudo test -f "$OLD_STATE_DIR/master.key"; then
     if sudo test -f "$STATE_DIR/master.key"; then
@@ -688,6 +721,9 @@ else
 fi
 info "  2. Try it:             sudo echo 'Hello from FaceAuth'"
 info ""
+if [ "${CAMERA_CHOICE:-${CURRENT_CAMERA:-auto}}" = "ir" ]; then
+    info "Check the IR light: faceauth benchmark (face brightness should be above 40)"
+fi
 info "Check your setup:  faceauth doctor"
 info "Uninstall:         $PREFIX/share/faceauth/uninstall.sh"
 info ""
