@@ -11,6 +11,9 @@ privilege-escalation bugs; upgrade, and set up face unlock again afterwards.
 
 ### Security
 
+- **The PAM module can't take down a login.** It runs inside the login screen,
+  the lock screen and sudo; any internal error now falls back to the password
+  instead of crashing the host process.
 - **Fixed path traversal in the daemon.** Usernames were joined onto the
   storage path unchecked. Any local user could make the root daemon delete any
   directory, including `/` (`DeleteUser { user: "/" }`), or create directories

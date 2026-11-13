@@ -329,14 +329,23 @@ class HelloOverlay {
     }
 
     _tick() {
-        const now = GLib.get_monotonic_time();
-        const dt = Math.min(0.1, (now - this._last) / 1e6);
-        this._last = now;
-        this._face.step(dt, St.Settings.get().enable_animations);
-        // The lock screen's prompt slides in; keep the face on the picture.
-        if (Main.sessionMode.isLocked && this._box.visible)
-            this._place();
-        return GLib.SOURCE_CONTINUE;
+        try {
+            const now = GLib.get_monotonic_time();
+            const dt = Math.min(0.1, (now - this._last) / 1e6);
+            this._last = now;
+            this._face.step(dt, St.Settings.get().enable_animations);
+            // The lock screen's prompt slides in; keep the face on the picture.
+            if (Main.sessionMode.isLocked && this._box.visible)
+                this._place();
+            return GLib.SOURCE_CONTINUE;
+        } catch (e) {
+            // Never disturb the lock screen: stop animating and step aside.
+            logError(e, 'FaceAuth hello face');
+            this._tickId = 0;
+            this._box.hide();
+            this._restoreWell();
+            return GLib.SOURCE_REMOVE;
+        }
     }
 
     _place() {
@@ -381,10 +390,14 @@ class HelloOverlay {
     }
 
     _modeChanged() {
-        if (!Main.sessionMode.isLocked)
-            this._restoreWell();
-        if (this._box.visible)
-            this._place();
+        try {
+            if (!Main.sessionMode.isLocked)
+                this._restoreWell();
+            if (this._box.visible)
+                this._place();
+        } catch (e) {
+            logError(e, 'FaceAuth hello face');
+        }
     }
 
     _clear(field) {

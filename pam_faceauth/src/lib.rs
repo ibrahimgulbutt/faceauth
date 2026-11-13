@@ -69,6 +69,15 @@ pub unsafe extern "C" fn pam_sm_authenticate(
     argc: c_int,
     argv: *const *const c_char,
 ) -> c_int {
+    // This runs inside the login screen, the lock screen and sudo. A bug here
+    // must never take them down (a panic leaving an `extern "C"` function
+    // aborts the whole process): anything unexpected falls back to the
+    // password.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| authenticate(pamh, flags, argc, argv)))
+        .unwrap_or(PAM_IGNORE)
+}
+
+unsafe fn authenticate(pamh: *mut pam_handle_t, flags: c_int, argc: c_int, argv: *const *const c_char) -> c_int {
     let quiet = flags & PAM_SILENT != 0 || module_args(argc, argv).iter().any(|a| a == "quiet");
     let say = |text: &str| {
         if !quiet {
