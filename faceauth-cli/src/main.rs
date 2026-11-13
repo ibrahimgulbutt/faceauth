@@ -68,6 +68,12 @@ enum Command {
     Doctor,
     /// Measure how long each stage of recognition takes
     Benchmark,
+    /// Find and switch on the infrared camera's light automatically (root)
+    IrSetup {
+        /// Print only the lines for /etc/faceauth/config.toml (for the installer)
+        #[arg(long)]
+        toml: bool,
+    },
     /// Show the IR-light settings saved by linux-enable-ir-emitter
     IrEmitter {
         /// linux-enable-ir-emitter configuration (default: ~/.config/linux-enable-ir-emitter.toml)
@@ -96,6 +102,7 @@ fn main() -> ExitCode {
         Command::Cameras => cameras(),
         Command::Doctor => doctor(),
         Command::Benchmark => benchmark(),
+        Command::IrSetup { toml } => ir_setup(toml),
         Command::IrEmitter { file, toml } => ir_emitter_cmd(file, toml),
         Command::Watch => watch(),
         Command::Version => version(),
@@ -342,6 +349,61 @@ fn benchmark() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         other => Err(unexpected(other)),
+    }
+}
+
+/// Exit codes: 0 the light works (lines printed with --toml; none if it was
+/// already on), 1 no setting switched it on, 2 error.
+fn ir_setup(toml_only: bool) -> Result<ExitCode> {
+    use faceauth_core::IrSetupEvent;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 && std::env::var_os("FACEAUTH_DEV_SKIP_POLKIT").is_none() {
+        bail!("this changes camera settings, so run it with sudo: sudo faceauth ir-setup");
+    }
+    let mut stream = connect(Duration::from_secs(90))?;
+    send_message(&mut stream, &Request::SetupIrEmitter)?;
+    eprintln!("Looking for the setting that switches on the infrared light.");
+    eprintln!("Sit in front of the camera, fairly close, and keep still. This takes a few minutes.");
+    loop {
+        match recv_message::<_, Response>(&mut stream)? {
+            Response::IrSetup(IrSetupEvent::Started { total, brightness }) => {
+                eprintln!("  {total} settings to try (face brightness now {brightness:.0} of 255)");
+            }
+            Response::IrSetup(IrSetupEvent::Progress { tried, total }) => {
+                eprint!("\r  Tried {tried} of {total}…   ");
+                let _ = std::io::stderr().flush();
+            }
+            Response::IrSetup(IrSetupEvent::Found { controls, before, after }) => {
+                eprintln!();
+                if controls.is_empty() {
+                    eprintln!("{} The infrared light already works (brightness {before:.0}).", Style::Ok.paint("✓"));
+                    return Ok(ExitCode::SUCCESS);
+                }
+                eprintln!("{} Found it: brightness {before:.0} → {after:.0}.", Style::Ok.paint("✓"));
+                let found: Vec<ir_emitter::Control> = controls
+                    .into_iter()
+                    .map(|c| ir_emitter::Control { unit: c.unit, selector: c.selector, control: c.control })
+                    .collect();
+                let lines = ir_emitter::to_toml(&found);
+                if !toml_only {
+                    eprintln!("Add these lines to /etc/faceauth/config.toml and run: sudo systemctl restart faceauth");
+                    eprintln!("(the installer does this for you)");
+                }
+                print!("{lines}");
+                return Ok(ExitCode::SUCCESS);
+            }
+            Response::IrSetup(IrSetupEvent::NotFound) => {
+                eprintln!();
+                eprintln!("{} No setting switched the infrared light on.", Style::Warn.paint("!"));
+                return Ok(ExitCode::from(1));
+            }
+            Response::IrSetup(IrSetupEvent::Failed { message }) => {
+                eprintln!();
+                eprintln!("{} {message}", Style::Error.paint("error:"));
+                return Ok(ExitCode::from(2));
+            }
+            other => return Err(unexpected(other)),
+        }
     }
 }
 

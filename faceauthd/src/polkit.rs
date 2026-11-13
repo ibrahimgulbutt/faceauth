@@ -81,7 +81,7 @@ pub async fn check(pid: i32, uid: u32, client_gone: impl Future<Output = ()>) ->
 
 /// `FACEAUTH_DEV_SKIP_POLKIT=1` is honoured only for a development daemon
 /// running as an ordinary login user, which PAM never trusts.
-fn dev_skip_enabled() -> bool {
+pub fn dev_skip_enabled() -> bool {
     if std::env::var("FACEAUTH_DEV_SKIP_POLKIT").as_deref() != Ok("1") {
         return false;
     }

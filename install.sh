@@ -223,7 +223,7 @@ if [ -z "$CAMERA_CHOICE" ] && [ -n "$IR_CAMERA" ]; then
     [ "$CURRENT_CAMERA" = "auto" ] && default=2
     printf '\n    This computer has an infrared camera (%s). Which camera should FaceAuth use?\n' "$IR_CAMERA"
     printf '      1) Infrared camera  works in the dark, harder to fool [recommended]\n'
-    printf '         (if its light is off, the installer helps you switch it on)\n'
+    printf '         (if its light is off, the installer tries to switch it on by itself)\n'
     printf '      2) Normal camera    works right away, needs some light\n'
     case "$(ask "    Choose [$default]: " "$default")" in
         2|auto|normal|colour) CAMERA_CHOICE=auto ;;
@@ -546,12 +546,13 @@ fi
 
 # set_ir_emitter TOML — replace any [camera.ir_emitter] / [[camera.ir_emitter]]
 # blocks with TOML (as printed by `faceauth ir-emitter --toml`).
-IR_MARKER="# IR light commands imported from linux-enable-ir-emitter by the installer."
+IR_MARKER="# Infrared light settings, added by the FaceAuth installer."
+IR_MARKER_OLD="# IR light commands imported from linux-enable-ir-emitter by the installer."
 set_ir_emitter() {
     local cfg="$CONFIG_DIR/config.toml" tmp
     tmp=$(mktemp)
-    sudo cat "$cfg" | awk -v marker="$IR_MARKER" '
-        $0 == marker { next }
+    sudo cat "$cfg" | awk -v marker="$IR_MARKER" -v old_marker="$IR_MARKER_OLD" '
+        $0 == marker || $0 == old_marker { next }
         /^[[:space:]]*\[/ { skip = ($0 ~ /^[[:space:]]*\[\[?[[:space:]]*camera\.ir_emitter[[:space:]]*\]/) }
         skip { next }
         /^[[:space:]]*$/ { blanks++; next }
@@ -614,21 +615,14 @@ fi
 
 # ── Infrared light ───────────────────────────────────────────────────────────
 #
-# An IR camera only sees in the dark when its infrared light (emitter) is on.
-# On many laptops Linux doesn't switch it on. linux-enable-ir-emitter (MIT,
-# github.com/EmixamPP/linux-enable-ir-emitter) finds the vendor command by
-# trying the camera's settings while the user confirms; FaceAuth then sends
-# that command itself. The tool is downloaded (pinned, checksummed) and run
-# here so users don't have to set anything up separately.
+# An IR camera only sees in the dark when its own infrared light (emitter) is
+# on, and on many laptops Linux doesn't switch it on. `faceauth ir-setup`
+# finds the vendor setting that does, by itself: it tries the camera's
+# settings one at a time, judges each by whether the face lights up, and puts
+# each one back. If nothing works, the colour camera is used instead, so face
+# unlock keeps working.
 
-IR_TOOL=linux-enable-ir-emitter
-IR_TOOL_VERSION=7.0.0
-declare -A IR_TOOL_SHA256=(
-    [x86_64]="b5ea03b8a058b4d028d7c54dbd307b4bac2159a32cd2999da06cadc692907375"
-    [aarch64]="c37e3da272f780ac0fd82de3c99e2aac9b914a66f03a2e5fd4cd58ee78978375"
-)
-
-# Face brightness (0–255) seen by the IR camera, or nothing if no face.
+# Face brightness (0–255) seen by the camera in use, or nothing if no face.
 ir_face_brightness() {
     env -u FACEAUTH_SOCKET "$PREFIX/bin/faceauth" benchmark 2>/dev/null \
         | sed -n 's/^Face[[:space:]]*brightness \([0-9][0-9]*\).*/\1/p'
@@ -643,78 +637,33 @@ restart_service() {
     return 1
 }
 
-install_ir_tool() {
-    if command -v "$IR_TOOL" >/dev/null 2>&1 && "$IR_TOOL" --version 2>/dev/null | grep -Eq " 7\."; then
-        return 0
-    fi
-    local arch sha asset dir
-    arch=$(uname -m)
-    sha="${IR_TOOL_SHA256[$arch]:-}"
-    [ -n "$sha" ] || { warn "No $IR_TOOL download for $arch."; return 1; }
-    asset="$IR_TOOL-$IR_TOOL_VERSION-release-${arch/_/-}.tar.gz"
-    dir=$(mktemp -d)
-    info "Downloading $IR_TOOL $IR_TOOL_VERSION..."
-    if ! curl -fsSL --proto '=https' --retry 3 -o "$dir/$asset" \
-        "https://github.com/EmixamPP/$IR_TOOL/releases/download/$IR_TOOL_VERSION/$asset"; then
-        rm -rf "$dir"; warn "Download failed."; return 1
-    fi
-    if ! echo "$sha  $dir/$asset" | sha256sum -c --status; then
-        rm -rf "$dir"; warn "Checksum mismatch for $asset; not using it."; return 1
-    fi
-    sudo tar -C /usr/local/bin --no-same-owner -m -xzf "$dir/$asset" "$IR_TOOL"
-    rm -rf "$dir"
-    ok "Installed $IR_TOOL $IR_TOOL_VERSION"
-}
-
 use_colour_camera() {
     CAMERA_CHOICE=auto
     set_config camera device auto
     restart_service || true
-    ok "Using the colour camera. Re-run this installer any time to try the IR camera again."
+    ok "Using the normal camera instead"
 }
 
-# setup_ir_light — find and save the command that switches the IR light on.
+has_emitter_config() {
+    sudo grep -Eq '^[[:space:]]*\[\[?[[:space:]]*camera\.ir_emitter' "$CONFIG_DIR/config.toml"
+}
+
+# setup_ir_light — find and save the setting that switches the IR light on.
 # Succeeds only if the light then works.
 setup_ir_light() {
-    [ "$HAVE_TTY" -eq 1 ] || { info "Switching the light on needs a terminal."; return 1; }
-    install_ir_tool || return 1
-    printf '\n'
-    info "${BOLD}Switching on the infrared light.${NC} A helper opens next. In it:"
-    info "  1. ${BOLD}IR Enabler${NC} is selected: press Enter."
-    info "  2. Leave the settings as they are: press Enter."
-    info "  3. \"Do you want to start?\": press Y."
-    info "  4. Sit in front of the camera and keep still. It asks"
-    info "     \"Is the camera emitter or preview blinking?\""
-    info "     ${BOLD}The first time it asks, nothing has been changed yet: press N.${NC}"
-    info "     After that, press Y only if the preview suddenly gets bright or"
-    info "     flickers (a phone camera shows the light as a purple flicker); else N."
-    info "  It can take a few minutes and closes by itself. Don't close the window;"
-    info "  to give up, press Esc. Guide with pictures: docs/INSTALL_GUIDE.md"
-    ask "    Press Enter to start: " "" >/dev/null
-    local tool_log="$HOME/.local/state/$IR_TOOL.log" log_lines=0
-    [ -f "$tool_log" ] && log_lines=$(wc -l <"$tool_log")
-    "$IR_TOOL" configure </dev/tty >/dev/tty 2>&1 || true
-    printf '\n'
-    local toml level
-    if ! toml=$("$PREFIX/bin/faceauth" ir-emitter --toml 2>/dev/null) || [ -z "$toml" ]; then
-        # Its first question ("is it blinking?") comes before it changes
-        # anything; Y there makes it stop at once, saying the light already works.
-        if [ -f "$tool_log" ] && tail -n +"$((log_lines + 1))" "$tool_log" | grep -q "already working"; then
-            warn "The helper stopped straight away: its first question was answered Y (\"yes, it's blinking\")."
-            info "The camera still can't see your face, so the light is really off. That first"
-            info "question comes before anything is tried: ${BOLD}press N${NC} there, and Y only later,"
-            info "if the picture suddenly gets bright."
-        else
-            warn "No setting that switches the light on was found."
-        fi
-        return 1
+    info "Switching on the infrared light automatically. Sit in front of the camera, fairly"
+    info "close, and keep still while FaceAuth tries the camera's settings (a few minutes)."
+    local toml rc=0 level
+    toml=$(sudo env -u FACEAUTH_SOCKET "$PREFIX/bin/faceauth" ir-setup --toml) || rc=$?
+    [ "$rc" -eq 0 ] || return 1
+    if [ -n "$toml" ]; then
+        set_ir_emitter "$toml"
+        restart_service || true
     fi
-    set_ir_emitter "$toml"
-    restart_service || true
-    ask "    Checking the light. Look at the camera, then press Enter: " "" >/dev/null
+    sleep 1
     level=$(ir_face_brightness)
     if [ -n "$level" ] && [ "$level" -ge 40 ]; then
-        ok "The infrared light works now (face brightness $level)"
+        ok "The infrared light works (face brightness $level)"
         return 0
     fi
     warn "The light still looks off (face brightness ${level:-none})."
@@ -722,32 +671,35 @@ setup_ir_light() {
 }
 
 if [ "$SERVICE_OK" -eq 1 ] && [ "${CAMERA_CHOICE:-${CURRENT_CAMERA:-auto}}" = "ir" ]; then
-    step "Checking the infrared light"
+    step "Setting up the infrared camera"
     if [ "$HAVE_TTY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then
         ask "    Look at the camera, then press Enter: " "" >/dev/null
-    else
-        sleep 1
     fi
     IR_LEVEL=$(ir_face_brightness)
-    if [ -n "$IR_LEVEL" ] && [ "$IR_LEVEL" -ge 40 ]; then
+    if has_emitter_config && [ -n "$IR_LEVEL" ] && [ "$IR_LEVEL" -ge 40 ]; then
         ok "The infrared light works (face brightness $IR_LEVEL)"
+    elif ! setup_ir_light; then
+        info "This camera's infrared light couldn't be switched on, so it can't see in the dark."
+        use_colour_camera
+    fi
+fi
+
+# ── Face data ────────────────────────────────────────────────────────────────
+# Face data made with the other camera (or an older version) can't be used.
+# Offer to set it up again right away instead of leaving face unlock paused.
+
+NEEDS_SETUP=0
+if [ "$SERVICE_OK" -eq 1 ] && env -u FACEAUTH_SOCKET "$PREFIX/bin/faceauth" status 2>/dev/null | grep -q "paused"; then
+    step "Setting up your face again"
+    info "Your face data was made with the other camera (or an older version), so face"
+    info "unlock is paused until you set it up again."
+    if [ "$HAVE_TTY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then
+        case "$(ask '    Set it up now? It takes about 30 seconds. [Y/n] ' y)" in
+            [Nn]*) NEEDS_SETUP=1 ;;
+            *) env -u FACEAUTH_SOCKET "$PREFIX/bin/faceauth" enroll </dev/tty || NEEDS_SETUP=1 ;;
+        esac
     else
-        if [ -n "$IR_LEVEL" ]; then
-            info "Face brightness is only $IR_LEVEL: the camera's infrared light is off."
-        else
-            info "The IR camera couldn't see a face: its infrared light is probably off."
-        fi
-        # Without a working light the IR camera is useless, so fall back to
-        # the colour camera rather than leave face unlock broken.
-        IR_DONE=0
-        for attempt in 1 2; do
-            if setup_ir_light; then IR_DONE=1; break; fi
-            [ "$attempt" -eq 2 ] && break
-            case "$(ask '    Try switching the light on again? [Y/n] ' y)" in
-                [Nn]*) break ;;
-            esac
-        done
-        [ "$IR_DONE" -eq 1 ] || use_colour_camera
+        NEEDS_SETUP=1
     fi
 fi
 

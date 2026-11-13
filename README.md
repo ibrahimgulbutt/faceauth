@@ -67,9 +67,9 @@ The installer:
    module, polkit policy and app;
 3. downloads the face models from InsightFace's official releases and verifies their SHA-256 checksums;
 4. starts the service;
-5. if there's an infrared camera, offers it (recommended), checks that its
-   light works, helps you switch it on if it doesn't, and falls back to the
-   colour camera if that fails (see [the guide](docs/INSTALL_GUIDE.md#3-switch-on-the-infrared-light-infrared-cameras-only));
+5. if there's an infrared camera, offers it (recommended), switches its light
+   on by itself if needed, and falls back to the normal camera (offering to
+   set up your face again) if it can't (see [the guide](docs/INSTALL_GUIDE.md#3-switch-on-the-infrared-light-infrared-cameras-only));
 6. asks where to use face unlock.
 
 That one command is all you need; nothing has to be downloaded or set up
@@ -236,6 +236,7 @@ Run `faceauth benchmark` to measure your own machine.
 | `faceauth doctor` | Check the service, camera, models, config and PAM setup |
 | `faceauth benchmark` | Time the capture, detection and recognition steps, and show face brightness |
 | `faceauth watch` | Print your face checks as they happen (what the face animation reacts to) |
+| `sudo faceauth ir-setup` | Find the setting that switches on an infrared camera's light |
 | `faceauth ir-emitter` | Show the IR-light settings saved by linux-enable-ir-emitter |
 | `faceauth version` | Show the CLI and daemon versions |
 
@@ -295,32 +296,21 @@ emitter stays off and the IR picture is nearly black. To check, run
 camera while it runs: phone cameras show the emitter as a flickering purple
 light.
 
-**The installer handles this** ([walkthrough with pictures](docs/INSTALL_GUIDE.md#3-switch-on-the-infrared-light-infrared-cameras-only)).
-It looks through the IR camera, and if the light is off it helps you switch it
-on: it downloads [linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter)
-(MIT licensed, checksum-verified), runs it with short on-screen instructions,
-saves what it finds and checks again. If the light can't be switched on, it
-goes back to the colour camera so face unlock still works.
+**The installer handles this, by itself.** When you choose the infrared
+camera, `faceauth ir-setup` tries the camera's vendor settings one at a time
+(the same approach as
+[linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter)),
+but instead of asking you after each try, it checks whether your face became
+clearly brighter, and confirms by switching the setting off and on again.
+Every setting is put back right after it's tried; long settings that look
+like calibration or firmware data are never touched. If a setting is found,
+FaceAuth switches the light on with it every time it uses the camera. If not
+(some laptops need a sequence of vendor commands), the installer uses the
+normal camera instead and offers to set up your face again.
 
-Doing it by hand instead: linux-enable-ir-emitter
-can find the vendor command for your camera. It's used by many people for
-exactly this, works with most UVC infrared cameras, and asks you to confirm
-before saving anything (a wrong value can make the camera misbehave until a
-reboot, which is why FaceAuth doesn't guess commands itself):
-
-1. Install it from its releases page (one `sudo tar` command, see its README).
-2. Run it **as yourself, not with sudo**, sitting close to the camera:
-   `linux-enable-ir-emitter configure`. Choose the IR camera and answer its
-   questions.
-3. Re-run the FaceAuth installer and choose the infrared camera. It reads what
-   the tool saved (`~/.config/linux-enable-ir-emitter.toml`) and FaceAuth then
-   switches the light on itself every time it uses the camera. You don't need
-   to run the tool again.
-4. Check with `faceauth benchmark`, then set up face unlock again.
-
-`faceauth ir-emitter` shows what the tool saved and the lines FaceAuth uses.
-`faceauth doctor` shows whether FaceAuth is switching the light on. The
-commands are only ever sent to the infrared camera.
+You can run the search yourself with `sudo faceauth ir-setup`. Settings found
+with linux-enable-ir-emitter are picked up too (`faceauth ir-emitter` shows
+them). `faceauth doctor` shows whether FaceAuth is switching the light on.
 
 Emitters that flash on every other frame are handled automatically.
 

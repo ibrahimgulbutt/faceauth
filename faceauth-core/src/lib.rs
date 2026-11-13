@@ -67,6 +67,11 @@ pub enum Request {
     /// animation). Answered with `Watching`, then one `AuthEvent` per event
     /// for the caller's account, until the client disconnects.
     Watch,
+    /// Root only (`sudo faceauth ir-setup`, run by the installer): find the
+    /// vendor command that switches on the infrared camera's light. Answered
+    /// with a stream of `IrSetup` events ending in `Found`, `NotFound` or
+    /// `Failed`.
+    SetupIrEmitter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +98,7 @@ pub enum Response {
     Benchmark(BenchmarkReport),
     Watching,
     AuthEvent(AuthEvent),
+    IrSetup(IrSetupEvent),
     /// The caller is not allowed to do this.
     Denied { reason: String },
     Error { message: String },
@@ -106,6 +112,26 @@ pub enum AuthEvent {
     Scanning,
     /// The check ended (also sent for checks that never reached the camera).
     Finished(AuthOutcome),
+}
+
+/// A UVC extension-unit control value: what switches an IR light on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmitterControl {
+    pub unit: u8,
+    pub selector: u8,
+    pub control: Vec<u8>,
+}
+
+/// Progress of the automatic search for the IR light switch. Brightness is
+/// the face's (or, with no face in view, the picture centre's), 0–255.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IrSetupEvent {
+    Started { total: usize, brightness: f32 },
+    Progress { tried: usize, total: usize },
+    /// The light works. `controls` switch it on; empty when it was on already.
+    Found { controls: Vec<EmitterControl>, before: f32, after: f32 },
+    NotFound,
+    Failed { message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

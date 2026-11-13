@@ -71,6 +71,7 @@ Each message is a `u32` big-endian length (at most 4 MiB) followed by JSON
 | `ListEnrolled` | anyone (non-root sees only themselves) | `Users(..)` |
 | `Cameras` | anyone | `Cameras(..)` |
 | `Benchmark` | anyone | `Benchmark(..)` |
+| `SetupIrEmitter` | root only | stream of `IrSetup(Started \| Progress \| Found \| NotFound \| Failed)` |
 | `Watch` | anyone (their own checks only) | `Watching`, then `AuthEvent(Scanning \| Finished(AuthOutcome))` per check, until disconnect |
 
 Any request may instead get `Denied { reason }` or `Error { message }`.
@@ -254,6 +255,18 @@ the IR camera when it finds one. IR emitters often need
 emitters flashing on alternate frames are handled by skipping dark frames.
 `faceauth benchmark` reports face brightness, which shows whether the emitter
 is on.
+
+`sudo faceauth ir-setup` (run by the installer when the IR camera is chosen)
+searches for the emitter switch itself: it lists the IR node's writable
+extension-unit controls (`UVC_GET_LEN`/`GET_INFO`/`GET_CUR`/`GET_MAX`), skips
+any longer than 16 bytes, and for each of the first 4 bytes tries the
+original value + 1..5 within the control's maximum. A try counts when the face
+(or picture centre) brightness reaches 55, at least 1.7× the baseline and +20,
+then drops when the control is restored and rises when it is re-applied.
+Every control is restored right after each try; a stream that drops is
+reopened; the search stops after 8 minutes. Root only, because it writes to
+the camera. On failure the installer falls back to the colour camera and
+offers to enroll again.
 
 ## Install, upgrade, uninstall
 

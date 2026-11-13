@@ -131,16 +131,23 @@ privilege-escalation bugs; upgrade, and set up face unlock again afterwards.
   (capped at 4 watchers per user, 16 in all). The installer adds and enables
   it (`--no-animation` skips it); `faceauth watch` prints the same events.
 - **Step-by-step install guide with screenshots** (`docs/INSTALL_GUIDE.md`).
+- **The IR light is switched on automatically.** `faceauth ir-setup` (root;
+  run by the installer) searches the IR camera's vendor controls one at a
+  time and judges each by whether the face clearly brightens, confirming by
+  switching it off and on again. Every control is restored straight after
+  each try, long controls (calibration or firmware data) are never touched, a
+  camera that drops out is reopened, and the search has a time limit. No
+  external tool or interactive screen is needed any more.
+- **No more "set up again" surprises.** When the installer changes camera,
+  or face data is otherwise unusable, it offers to set up the face right away.
 - **One command does everything.** An infrared camera is offered (and is the
-  default answer) when present. The installer checks the IR light through the camera; if it's
-  off, it downloads linux-enable-ir-emitter 7.0.0 (pinned, SHA-256 verified), guides
-  the user through it, imports the result, checks again, and falls back to the
-  colour camera if the light can't be switched on.
+  default answer) when present; the installer switches its light on by itself
+  (see above) or falls back to the normal camera.
 - **Re-running the installer says what it will do:** install, upgrade
   ("FaceAuth A is installed. Upgrading to B"), repair the same version, or refuse a silent downgrade. Current settings are the defaults, and
   the summary says what happened.
-- **IR light settings are imported.** When the infrared camera is chosen, the
-  installer reads what linux-enable-ir-emitter (v7) saved for that camera and
+- **IR light settings from linux-enable-ir-emitter are picked up.** If it was
+  run by hand, the installer reads what it (v7) saved for that camera and
   writes it to `[[camera.ir_emitter]]` (several commands supported). FaceAuth
   then switches the light on itself every time, and only ever sends these
   commands to an infrared stream. `faceauth ir-emitter` shows the saved

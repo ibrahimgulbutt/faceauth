@@ -479,43 +479,159 @@ fn strobe_level(levels: &[f32]) -> Option<f32> {
 }
 
 /// Send the vendor command that switches on an IR emitter (a UVC extension
-/// unit control, as found by tools such as linux-enable-ir-emitter).
+/// unit control, found by `faceauth ir-setup` or linux-enable-ir-emitter).
 fn enable_emitter(index: u32, emitter: &IrEmitter) -> Result<()> {
-    use std::os::fd::AsRawFd;
-    #[repr(C)]
-    struct UvcXuControlQuery {
-        unit: u8,
-        selector: u8,
-        query: u8,
-        size: u16,
-        data: *mut u8,
-    }
-    // _IOWR('u', 0x21, struct uvc_xu_control_query)
-    const UVCIOC_CTRL_QUERY: libc::c_ulong = (3 << 30)
-        | ((std::mem::size_of::<UvcXuControlQuery>() as libc::c_ulong) << 16)
-        | ((b'u' as libc::c_ulong) << 8)
-        | 0x21;
-    const UVC_SET_CUR: u8 = 0x01;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(format!("/dev/video{index}"))
-        .with_context(|| format!("opening /dev/video{index}"))?;
-    let mut data = emitter.control.clone();
-    let mut query = UvcXuControlQuery {
-        unit: emitter.unit,
-        selector: emitter.selector,
-        query: UVC_SET_CUR,
-        size: data.len() as u16,
-        data: data.as_mut_ptr(),
-    };
-    // SAFETY: `query` points at a live buffer of `size` bytes for the call.
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), UVCIOC_CTRL_QUERY as _, &mut query) };
-    if rc != 0 {
-        bail!("UVC control (unit {}, selector {}) failed: {}", emitter.unit, emitter.selector, std::io::Error::last_os_error());
-    }
+    let device = UvcDevice::open(index)?;
+    device
+        .set(emitter.unit, emitter.selector, &emitter.control)
+        .with_context(|| format!("UVC control (unit {}, selector {})", emitter.unit, emitter.selector))?;
     info!("IR emitter switched on (unit {}, selector {})", emitter.unit, emitter.selector);
     Ok(())
+}
+
+// ─── UVC extension-unit controls ────────────────────────────────────────────
+
+#[repr(C)]
+struct UvcXuControlQuery {
+    unit: u8,
+    selector: u8,
+    query: u8,
+    size: u16,
+    data: *mut u8,
+}
+
+// _IOWR('u', 0x21, struct uvc_xu_control_query)
+const UVCIOC_CTRL_QUERY: libc::c_ulong = (3 << 30)
+    | ((std::mem::size_of::<UvcXuControlQuery>() as libc::c_ulong) << 16)
+    | ((b'u' as libc::c_ulong) << 8)
+    | 0x21;
+const UVC_SET_CUR: u8 = 0x01;
+const UVC_GET_CUR: u8 = 0x81;
+const UVC_GET_MAX: u8 = 0x83;
+const UVC_GET_LEN: u8 = 0x85;
+const UVC_GET_INFO: u8 = 0x86;
+
+/// A vendor (extension-unit) control on a UVC camera.
+#[derive(Debug, Clone)]
+pub struct XuControl {
+    pub unit: u8,
+    pub selector: u8,
+    /// Value before anything was changed; always restored.
+    pub init: Vec<u8>,
+    pub max: Option<Vec<u8>>,
+}
+
+/// A camera node opened for UVC control queries (not for streaming).
+pub struct UvcDevice {
+    file: std::fs::File,
+}
+
+impl UvcDevice {
+    pub fn open(index: u32) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/dev/video{index}"))
+            .with_context(|| format!("opening /dev/video{index}"))?;
+        Ok(Self { file })
+    }
+
+    fn query(&self, unit: u8, selector: u8, query: u8, data: &mut [u8]) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut q = UvcXuControlQuery { unit, selector, query, size: data.len() as u16, data: data.as_mut_ptr() };
+        // SAFETY: `q` points at a live buffer of `size` bytes for the call.
+        let rc = unsafe { libc::ioctl(self.file.as_raw_fd(), UVCIOC_CTRL_QUERY as _, &mut q) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn set(&self, unit: u8, selector: u8, value: &[u8]) -> std::io::Result<()> {
+        let mut data = value.to_vec();
+        self.query(unit, selector, UVC_SET_CUR, &mut data)
+    }
+
+    /// Every writable extension-unit control the camera declares. The kernel
+    /// answers only for controls in the camera's descriptors, so probing all
+    /// unit/selector pairs is quick and touches nothing.
+    pub fn controls(&self) -> Vec<XuControl> {
+        let mut found = Vec::new();
+        for unit in 1..=254u8 {
+            for selector in 1..=254u8 {
+                let mut len = [0u8; 2];
+                if self.query(unit, selector, UVC_GET_LEN, &mut len).is_err() {
+                    continue;
+                }
+                let len = u16::from_le_bytes(len) as usize;
+                if len == 0 || len > 64 {
+                    continue;
+                }
+                let mut info = [0u8; 1];
+                // GET_INFO bit 1: SET_CUR supported.
+                if self.query(unit, selector, UVC_GET_INFO, &mut info).is_err() || info[0] & 0x02 == 0 {
+                    continue;
+                }
+                let mut init = vec![0u8; len];
+                if self.query(unit, selector, UVC_GET_CUR, &mut init).is_err() {
+                    continue;
+                }
+                let mut max = vec![0u8; len];
+                let max = self.query(unit, selector, UVC_GET_MAX, &mut max).ok().map(|_| max);
+                found.push(XuControl { unit, selector, init, max });
+            }
+        }
+        found
+    }
+}
+
+/// A greyscale stream from the first infrared camera, whatever
+/// `camera.device` says. Used by the IR light search.
+pub struct IrStream {
+    backend: Option<Backend>,
+    pub index: u32,
+}
+
+impl IrStream {
+    pub fn open() -> Result<Self> {
+        let device = list_devices().into_iter().find(|d| d.infrared).context("No infrared camera found")?;
+        Ok(Self { backend: Some(Self::start(device.index)?), index: device.index })
+    }
+
+    fn start(index: u32) -> Result<Backend> {
+        let formats: Vec<CameraFormat> =
+            probe(index)?.into_iter().filter(|f| f.format() == FrameFormat::GRAY).collect();
+        let fmt = choose_format(&formats).context("The infrared camera offers no greyscale format")?;
+        let mut backend = Backend::open(index, fmt)?;
+        backend.start()?;
+        for _ in 0..8 {
+            backend.skip_frame();
+        }
+        Ok(backend)
+    }
+
+    /// Close the stream completely (the old file handle must be gone, or
+    /// the camera reports busy), wait a moment, and start it again.
+    pub fn reopen(&mut self) -> Result<()> {
+        if let Some(mut old) = self.backend.take() {
+            old.stop();
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        self.backend = Some(Self::start(self.index)?);
+        Ok(())
+    }
+
+    pub fn frame(&mut self) -> Result<RgbImage> {
+        self.backend.as_mut().context("camera closed")?.read()
+    }
+}
+
+impl Drop for IrStream {
+    fn drop(&mut self) {
+        if let Some(backend) = &mut self.backend {
+            backend.stop();
+        }
+    }
 }
 
 pub fn describe_devices(selected: Option<u32>) -> Vec<CameraDevice> {

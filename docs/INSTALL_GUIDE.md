@@ -34,7 +34,7 @@ cd faceauth
 ```
 
 That's the only command you need. The installer downloads everything itself
-(build tools, the face models and, if needed, the infrared light helper) and
+(build tools and the face models) and
 checks every download against a known checksum. Building takes a few minutes
 the first time.
 
@@ -63,7 +63,7 @@ for Windows Hello)
 ```
 This computer has an infrared camera (Integrated IR Camera). Which camera should FaceAuth use?
   1) Infrared camera  works in the dark, harder to fool [recommended]
-     (if its light is off, the installer helps you switch it on)
+     (if its light is off, the installer tries to switch it on by itself)
   2) Normal camera    works right away, needs some light
 Choose [1]:
 ```
@@ -87,88 +87,38 @@ doesn't know that vendor command, so on many laptops the light stays off and
 the infrared picture is almost black, **even in a bright room**: normal room
 lights give off almost no infrared.
 
-The installer checks this for you:
+The installer handles this by itself. You only have to look at the camera:
 
 ```
-==> Checking the infrared light
+==> Setting up the infrared camera
     Look at the camera, then press Enter:
+    Switching on the infrared light automatically. Sit in front of the camera, fairly
+    close, and keep still while FaceAuth tries the camera's settings (a few minutes).
+  154 settings to try (face brightness now 24 of 255)
+  Tried 60 of 154…
+✓ Found it: brightness 24 → 140.
+    ✓ The infrared light works (face brightness 140)
 ```
 
-Look at the camera and press **Enter**. If the light already works, you'll see
-`✓ The infrared light works` and can skip to [step 4](#4-set-up-your-face).
+FaceAuth tries the camera's hidden settings one at a time. After each, it
+checks whether your face suddenly becomes clearly brighter, and it confirms
+by switching the setting off and on again. Every setting is put back
+straight after it's tried. Once found, FaceAuth switches the light on itself
+whenever it uses the camera.
 
-If it's off, the installer downloads a small open-source helper,
-[linux-enable-ir-emitter](https://github.com/EmixamPP/linux-enable-ir-emitter),
-which finds the right command by trying the camera's settings one by one while
-it watches the picture. The installer prints the steps, then waits for
-**Enter** before opening the helper.
-
-### 3.1 Choose "IR Enabler"
-
-![The helper's first screen, with IR Enabler selected](screenshots/ir-1-choose-tool.png)
-
-**IR Enabler** is already selected (orange). Press **Enter**.
-(UVC Tweaker is a manual mode for experts. You don't need it.)
-
-### 3.2 Keep the settings
-
-![The settings screen. Path is /dev/video2 and manual validation is off](screenshots/ir-2-settings.png)
-
-Don't change anything. **Path** is your infrared camera, and *Manual validation:
-false* means the helper judges the picture itself. Press **Enter**.
-
-### 3.3 Start
-
-![The "Do you want to start?" confirmation](screenshots/ir-3-start.png)
-
-Read the note, then press **Y**. From now on:
-
-- sit in front of the camera, fairly close, and keep still;
-- keep the lighting the same (don't switch lights on or off);
-- **don't close the window or press Ctrl+C**. To give up, press **Esc**.
-
-### 3.4 Answer its questions
-
-![The question "Is the camera emitter or preview blinking?" next to a dark camera preview](screenshots/ir-4-question.png)
-
-When the helper isn't sure, it asks **"Is the camera emitter or preview
-blinking?"**
-
-> **The first time it asks, it hasn't changed anything yet. Press N.**
-> The dark, blocky preview above is what "off" looks like.
-
-After that, it tries settings and may ask again:
-
-- press **Y** only if the preview suddenly gets brighter or flickers, or you
-  see a flashing light next to the lens. A phone camera pointed at the laptop
-  shows the infrared light as a purple-white flicker;
-- otherwise press **N**.
-
-It can take a few minutes and closes by itself when it's done.
-
-### 3.5 What happens next
-
-The installer reads what the helper found, saves it in FaceAuth's settings
-and checks the light again:
+**If no setting switches the light on,** some laptops need more than one
+vendor command, which nobody has worked out for every model. The installer
+then uses your normal camera instead, so face unlock still works (it just
+needs some light):
 
 ```
-    Checking the light. Look at the camera, then press Enter:
-    ✓ The infrared light works now (face brightness 112)
+! No setting switched the infrared light on.
+    This camera's infrared light couldn't be switched on, so it can't see in the dark.
+    ✓ Using the normal camera instead
 ```
 
-FaceAuth now switches the light on itself every time it uses the camera. The
-helper doesn't need to run again.
-
-If no setting was found, the installer offers to try again. If you say no,
-or the second try also fails, **it switches to the normal camera** so face
-unlock still works:
-
-```
-    ✓ Using the colour camera. Re-run this installer any time to try the IR camera again.
-```
-
-Pressed the wrong key? Just run the installer again and choose the infrared
-camera.
+The next time you run the installer, the normal camera is the suggested
+answer.
 
 ---
 
@@ -190,7 +140,9 @@ Only your face should be in view.
 
 ![Face Unlock when it's set up](screenshots/home.png)
 
-**Already set up before, or changed camera?** If the app says face unlock is
+**Already set up before, or changed camera?** Face data from another camera
+or an older version can't be reused. The installer notices and offers to set
+up your face again right away. Otherwise, if the app says face unlock is
 **paused**, choose **Set Up Again**. Face data from another camera or an
 older version can't be reused, so it isn't.
 
@@ -255,7 +207,6 @@ tells you what to fix.
 | `sudo: ./install.sh: command not found` | You're not in the FaceAuth folder. `cd` into it first. |
 | `Run this as your regular user, not root` | You're in a root shell (`root@…#`). Type `exit`, then run the installer again. |
 | The infrared picture is black in a bright room | Normal: room lights give off almost no infrared. The camera's own light has to be on; see [step 3](#3-switch-on-the-infrared-light-infrared-cameras-only). |
-| "the IR emitter is already working" but it isn't | **Y** was pressed at the helper's first question. Run the installer again and press **N** the first time. |
 | Not sure the infrared light works | `faceauth benchmark` while looking at the camera: face brightness above 40 means it's on. |
 | The app says face unlock is **paused** | The camera or face model changed. Choose **Set Up Again**. |
 | No password dialog when setting up | Run `faceauth enroll` in a terminal instead. |
@@ -273,6 +224,6 @@ with the output of `faceauth doctor`.
 ```
 
 It removes FaceAuth from every PAM file (with backups), the service, the files
-and, if you agree, your face data. The infrared helper, if installed, stays in
-`/usr/local/bin/linux-enable-ir-emitter`. Remove it with
-`sudo rm /usr/local/bin/linux-enable-ir-emitter` if you like.
+and, if you agree, your face data. Earlier versions of the installer could
+also install `linux-enable-ir-emitter` in `/usr/local/bin`; remove it with
+`sudo rm /usr/local/bin/linux-enable-ir-emitter` if it's there.

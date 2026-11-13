@@ -6,6 +6,7 @@ mod camera;
 mod config;
 mod detection;
 mod enroll;
+mod irsetup;
 mod liveness;
 mod polkit;
 mod recognition;
@@ -19,7 +20,7 @@ use camera::CameraManager;
 use config::Config;
 use detection::FaceDetector;
 use faceauth_core::{
-    encode_message, is_safe_username, AuthEvent, AuthOutcome, EnrollEvent, EnrollFailure, EnrollMode, EnrolledUser, Request,
+    encode_message, is_safe_username, AuthEvent, AuthOutcome, EnrollEvent, IrSetupEvent, EnrollFailure, EnrollMode, EnrolledUser, Request,
     Response, UserStatus, DAEMON_USER, MAX_MESSAGE_BYTES, MAX_SAMPLES, PROTOCOL_VERSION, SOCKET_DIR, VERSION,
 };
 use log::{error, info, warn};
@@ -274,8 +275,62 @@ async fn handle_client(stream: UnixStream, peer: Peer, d: Arc<Daemon>) -> Result
             }
             Request::Benchmark => send(&mut wr, &benchmark(&d).await).await?,
             Request::Watch => return watch(&d, peer, &mut rd, &mut wr).await,
+            Request::SetupIrEmitter => ir_setup(&d, peer, &mut rd, &mut wr).await?,
         }
     }
+}
+
+/// Find the command that switches on the IR camera's light. Root only: it
+/// writes vendor settings to the camera (each is put back right after it's
+/// tried). Face checks wait meanwhile.
+async fn ir_setup(d: &Arc<Daemon>, peer: Peer, rd: &mut OwnedReadHalf, wr: &mut OwnedWriteHalf) -> Result<()> {
+    // Development: a daemon running as an ordinary user may let that same
+    // user run it (it can only reach cameras that user can reach anyway).
+    let dev = polkit::dev_skip_enabled() && peer.uid == users::effective_uid();
+    if peer.uid != 0 && !dev {
+        AuditLogger::denied("ir-setup", None, peer.uid, "only root may change camera settings");
+        return send(wr, &Response::Denied { reason: "only root can change camera settings (sudo faceauth ir-setup)".into() }).await;
+    }
+    let failed = |message: &str| Response::IrSetup(IrSetupEvent::Failed { message: message.into() });
+    let Ok(Ok(_permit)) = tokio::time::timeout(AUTH_QUEUE_WAIT, d.auth_gate.acquire()).await else {
+        return send(wr, &failed("face unlock is busy; try again")).await;
+    };
+    AuditLogger::event("IR_SETUP_START", "-", peer.uid, "");
+
+    let (tx, mut rx) = mpsc::channel::<Response>(8);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let (d, cancel) = (d.clone(), cancel.clone());
+        tokio::task::spawn_blocking(move || {
+            let Some(_camera) = camera::lock_camera(&d.camera, CAMERA_WAIT) else {
+                return Ok(IrSetupEvent::Failed { message: "the camera is in use".into() });
+            };
+            irsetup::search(&d.detector, &tx, &cancel)
+        })
+    };
+    loop {
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(m) => if send(wr, &m).await.is_err() { cancel.store(true, Ordering::Relaxed); break; },
+                None => break,
+            },
+            _ = client_gone(rd) => { cancel.store(true, Ordering::Relaxed); break; }
+        }
+    }
+    drop(rx);
+    let result = match worker.await? {
+        Ok(event) => event,
+        Err(e) => {
+            error!("IR setup: {e:#}");
+            IrSetupEvent::Failed { message: format!("{e:#}") }
+        }
+    };
+    let summary = match &result {
+        IrSetupEvent::Found { controls, before, after } => format!("found={controls:?} before={before:.0} after={after:.0}"),
+        other => format!("{other:?}"),
+    };
+    AuditLogger::event("IR_SETUP_DONE", "-", peer.uid, &summary);
+    send(wr, &Response::IrSetup(result)).await
 }
 
 /// Stream the caller's own face-check events until they disconnect. A user
