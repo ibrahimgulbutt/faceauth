@@ -691,11 +691,22 @@ setup_ir_light() {
     info "  It can take a few minutes and closes by itself. Don't close the window;"
     info "  to give up, press Esc. Guide with pictures: docs/INSTALL_GUIDE.md"
     ask "    Press Enter to start: " "" >/dev/null
-    "$IR_TOOL" configure </dev/tty >/dev/tty 2>&1 || warn "$IR_TOOL exited with an error."
+    local tool_log="$HOME/.local/state/$IR_TOOL.log" log_lines=0
+    [ -f "$tool_log" ] && log_lines=$(wc -l <"$tool_log")
+    "$IR_TOOL" configure </dev/tty >/dev/tty 2>&1 || true
     printf '\n'
     local toml level
     if ! toml=$("$PREFIX/bin/faceauth" ir-emitter --toml 2>/dev/null) || [ -z "$toml" ]; then
-        warn "No setting that switches the light on was found."
+        # Its first question ("is it blinking?") comes before it changes
+        # anything; Y there makes it stop at once, saying the light already works.
+        if [ -f "$tool_log" ] && tail -n +"$((log_lines + 1))" "$tool_log" | grep -q "already working"; then
+            warn "The helper stopped straight away: its first question was answered Y (\"yes, it's blinking\")."
+            info "The camera still can't see your face, so the light is really off. That first"
+            info "question comes before anything is tried: ${BOLD}press N${NC} there, and Y only later,"
+            info "if the picture suddenly gets bright."
+        else
+            warn "No setting that switches the light on was found."
+        fi
         return 1
     fi
     set_ir_emitter "$toml"
