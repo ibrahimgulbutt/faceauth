@@ -56,6 +56,8 @@ Options:
                sudo, login, lock, polkit, or none.
   --yes, -y    Don't ask questions; use the defaults (face unlock for sudo only).
   --no-gui     Don't build or install the Face Unlock app.
+  --no-animation  Don't install the animated face for GNOME (lock screen,
+               sudo and admin prompts).
   --model=NAME Face recognizer: accurate (ResNet50, ~300 MB download,
                recommended) or fast (MobileFaceNet, ~15 MB). Default: accurate.
   --camera=KIND  ir (infrared camera) or auto (normal colour camera).
@@ -77,6 +79,7 @@ MODEL_CHOICE=""
 CAMERA_CHOICE=""
 ASSUME_YES=0
 WANT_GUI=1
+WANT_ANIMATION=1
 for arg in "$@"; do
     case "$arg" in
         --pam=*)  PAM_CHOICE="${arg#--pam=}" ;;
@@ -84,6 +87,7 @@ for arg in "$@"; do
         --camera=*) CAMERA_CHOICE="${arg#--camera=}" ;;
         --yes|-y) ASSUME_YES=1 ;;
         --no-gui) WANT_GUI=0 ;;
+        --no-animation) WANT_ANIMATION=0 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "Unknown option: $arg" ;;
     esac
@@ -436,6 +440,44 @@ if [ "$BUILD_GUI" -eq 1 ]; then
 else
     # An app left over from an older install would speak the old protocol.
     sudo rm -f "$PREFIX/bin/faceauth-gui" /usr/share/applications/org.faceauth.gui.desktop
+fi
+
+# GNOME: the animated face on the lock screen and for sudo/admin prompts. It
+# only listens to faceauthd and can't approve or block anything.
+SHELL_EXT_UUID="faceauth@ibrahimgulbutt.github.io"
+SHELL_EXT_DIR="/usr/share/gnome-shell/extensions/$SHELL_EXT_UUID"
+FACE_ANIMATION=0
+GNOME_MAJOR=$(gnome-shell --version 2>/dev/null | awk '{print int($3)}')
+
+# with_extension LIST — LIST (a GVariant string array) with the extension added.
+with_extension() {
+    case "$1" in
+        *"'$SHELL_EXT_UUID'"*) printf '%s' "$1" ;;
+        "@as []"|"[]"|"") printf "['%s']" "$SHELL_EXT_UUID" ;;
+        *) printf "%s, '%s']" "${1%]}" "$SHELL_EXT_UUID" ;;
+    esac
+}
+
+if [ "$WANT_ANIMATION" -eq 1 ] && [ "${GNOME_MAJOR:-0}" -ge 45 ]; then
+    sudo rm -rf "$SHELL_EXT_DIR"
+    sudo install -D -m 644 -t "$SHELL_EXT_DIR" \
+        "dist/gnome-shell/$SHELL_EXT_UUID/metadata.json" \
+        "dist/gnome-shell/$SHELL_EXT_UUID/extension.js" \
+        "dist/gnome-shell/$SHELL_EXT_UUID/stylesheet.css"
+    FACE_ANIMATION=1
+    current=$(gsettings get org.gnome.shell enabled-extensions 2>/dev/null || true)
+    if [ -n "$current" ] && gsettings set org.gnome.shell enabled-extensions "$(with_extension "$current")" 2>/dev/null; then
+        ok "Installed the face animation for GNOME (lock screen, sudo and admin prompts)"
+    else
+        ok "Installed the face animation for GNOME"
+        info "Turn it on after logging back in: gnome-extensions enable $SHELL_EXT_UUID"
+    fi
+    if [ "$(gsettings get org.gnome.shell disable-user-extensions 2>/dev/null)" = "true" ]; then
+        warn "GNOME extensions are switched off in your settings, so the face animation won't show."
+        info "Switch them on in the Extensions app."
+    fi
+elif [ "$WANT_ANIMATION" -eq 1 ] && [ -n "$GNOME_MAJOR" ] && [ "$GNOME_MAJOR" -gt 0 ]; then
+    info "Face animation skipped: it needs GNOME 45 or newer (you have $GNOME_MAJOR)."
 fi
 
 # ── Models ───────────────────────────────────────────────────────────────────
@@ -905,6 +947,9 @@ info "  2. Try it:             sudo echo 'Hello from FaceAuth'"
 info ""
 if [ "${CAMERA_CHOICE:-${CURRENT_CAMERA:-auto}}" = "ir" ]; then
     info "Check the IR light: faceauth benchmark (face brightness should be above 40)"
+fi
+if [ "$FACE_ANIMATION" -eq 1 ]; then
+    info "Face animation:    log out and back in once to see it (lock screen, sudo)"
 fi
 info "Check your setup:  faceauth doctor"
 info "Uninstall:         $PREFIX/share/faceauth/uninstall.sh"

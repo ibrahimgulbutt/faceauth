@@ -96,6 +96,18 @@ impl Progress {
     }
 }
 
+/// Local wall-clock time, "14:05:09".
+pub fn now() -> String {
+    // SAFETY: time() with a null pointer only returns the time; localtime_r
+    // writes into `tm` and nothing else.
+    let t = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return String::new();
+    }
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

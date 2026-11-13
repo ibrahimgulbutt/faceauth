@@ -136,12 +136,24 @@ sudo rm -f \
     /usr/share/applications/org.faceauth.gui.desktop \
     /usr/share/icons/hicolor/scalable/apps/org.faceauth.gui.svg
 sudo rm -rf /usr/share/faceauth
+# The GNOME face animation, and its entry in this user's enabled extensions.
+SHELL_EXT_UUID="faceauth@ibrahimgulbutt.github.io"
+sudo rm -rf "/usr/share/gnome-shell/extensions/$SHELL_EXT_UUID"
+if [ "${EUID:-$(id -u)}" -ne 0 ] && command -v gsettings >/dev/null 2>&1; then
+    current=$(gsettings get org.gnome.shell enabled-extensions 2>/dev/null || true)
+    case "$current" in
+        *"'$SHELL_EXT_UUID'"*)
+            remaining=$(printf '%s' "$current" | sed -e "s/, '$SHELL_EXT_UUID'//; s/'$SHELL_EXT_UUID', //; s/'$SHELL_EXT_UUID'//")
+            gsettings set org.gnome.shell enabled-extensions "$remaining" 2>/dev/null || true
+            ;;
+    esac
+fi
 sudo find /tmp -maxdepth 1 -name faceauth.sock -type s -user root -delete 2>/dev/null || true
 sudo gtk-update-icon-cache -qtf /usr/share/icons/hicolor 2>/dev/null || true
 sudo update-desktop-database -q /usr/share/applications 2>/dev/null || true
 sudo systemctl daemon-reload 2>/dev/null || true
 sudo systemctl reset-failed faceauth.service 2>/dev/null || true
-ok "Removed programs, PAM module, service, polkit policy, app entry and models"
+ok "Removed programs, PAM module, service, polkit policy, app entry, face animation and models"
 
 # ── Face data and configuration ──────────────────────────────────────────────
 

@@ -1,0 +1,30 @@
+/* FaceAuth hello face. The face itself is drawn in extension.js. */
+.faceauth-hello {
+  spacing: 10px;
+}
+
+/* Corner pop-up for sudo and admin prompts. */
+.faceauth-hello-popup {
+  background-color: rgba(22, 29, 36, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+  padding: 16px 20px 14px 20px;
+  /* Wide enough for every caption, so the card doesn't change size between states. */
+  min-width: 136px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+
+.faceauth-hello-label {
+  color: #eef3f7;
+  font-weight: bold;
+  text-align: center;
+}
+
+.faceauth-hello-popup .faceauth-hello-label {
+  font-size: 10.5pt;
+}
+
+/* On the lock screen it takes the place of your picture, with no card. */
+.faceauth-hello-lock .faceauth-hello-label {
+  font-size: 13pt;
+}

@@ -71,6 +71,7 @@ Each message is a `u32` big-endian length (at most 4 MiB) followed by JSON
 | `ListEnrolled` | anyone (non-root sees only themselves) | `Users(..)` |
 | `Cameras` | anyone | `Cameras(..)` |
 | `Benchmark` | anyone | `Benchmark(..)` |
+| `Watch` | anyone (their own checks only) | `Watching`, then `AuthEvent(Scanning \| Finished(AuthOutcome))` per check, until disconnect |
 
 Any request may instead get `Denied { reason }` or `Error { message }`.
 
@@ -167,6 +168,29 @@ client                         daemon
 
 `Remove` → polkit (self) → delete `/var/lib/faceauth/<user>` → `Removed`. The
 GUI asks for confirmation first; the CLI asks unless `--yes`.
+
+## Face animation (GNOME Shell extension)
+
+`dist/gnome-shell/faceauth@ibrahimgulbutt.github.io`, installed system-wide
+for GNOME 45+ and enabled for the installing user.
+
+* It connects to the socket and sends `Watch`. The daemon tags every
+  `authenticate` event with the uid of the account being checked and sends
+  each watcher only events for its own uid (`SO_PEERCRED`), so a user learns
+  only when their own account is checked, and the result.
+* Watchers are capped at 4 per uid and 16 in all, so they can't use up the
+  client slots logins need. The extension reconnects with back-off.
+* `Scanning` shows the face (looking); `Finished(Matched)` smiles,
+  `Finished(NotMatched | NotLive | NoFace | BadLighting)` looks sad, any other
+  outcome hides it. A check that never reached the camera shows nothing.
+* Placement: on the lock screen, over the user picture above the password box
+  (hidden while the face is up; a fixed spot if it isn't there); otherwise a
+  card in the bottom-right corner (sudo, polkit prompts). Added with
+  `addTopChrome`, so it is above windows and the lock screen and never takes
+  input.
+* It only displays. Nothing in it can approve or block authentication.
+* Not covered: the GDM login screen before a session exists, and other
+  desktops (they keep the PAM text messages).
 
 ## GUI (GTK ≥ 4.12, libadwaita ≥ 1.4)
 

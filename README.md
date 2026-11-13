@@ -131,6 +131,10 @@ sessions.
 - **Any V4L2 camera,** including infrared (Windows Hello-style) cameras, which
   work in the dark. Dim colour images are brightened before recognition.
 - **Rate limiting and audit logging** of every attempt to the system journal.
+- **A face that reacts (GNOME):** while it checks, a little face looks for you
+  on the lock screen (where your picture is) or in the corner for `sudo` and
+  admin prompts. It smiles when it recognizes you and looks sad when it
+  doesn't.
 
 ## How it works
 
@@ -154,6 +158,24 @@ sudo ──▶ pam_faceauth.so ──▶ faceauthd (user "faceauth")
 
 More detail: [docs/DESIGN.md](docs/DESIGN.md) (flows and trust boundaries),
 [ARCHITECTURE.md](ARCHITECTURE.md), [TECHNICAL_DETAILS.md](TECHNICAL_DETAILS.md).
+
+### Face animation
+
+<p>
+  <img src="docs/screenshots/face-lock-looking.png" width="32%" alt="Lock screen: the face looks for you above the password box">
+  <img src="docs/screenshots/face-lock-ok.png" width="32%" alt="Lock screen: the face smiles when you're recognized">
+  <img src="docs/screenshots/face-lock-bad.png" width="32%" alt="Lock screen: the face looks sad when you're not recognized">
+</p>
+
+On GNOME 45 and newer the installer adds a small GNOME Shell extension that
+shows this face while FaceAuth checks you: on the lock screen in place of your
+picture, and as a card in the bottom-right corner for `sudo` and admin
+password prompts. Log out and back in once after installing to see it.
+
+It only listens for your own face checks and can't approve or block
+anything. Skip it with `./install.sh --no-animation`, or switch it off in
+the Extensions app. Other desktops, and the login screen right after power-on,
+keep the text messages.
 
 ### Face models
 
@@ -213,6 +235,7 @@ Run `faceauth benchmark` to measure your own machine.
 | `faceauth cameras` | List cameras and show which one is used |
 | `faceauth doctor` | Check the service, camera, models, config and PAM setup |
 | `faceauth benchmark` | Time the capture, detection and recognition steps, and show face brightness |
+| `faceauth watch` | Print your face checks as they happen (what the face animation reacts to) |
 | `faceauth ir-emitter` | Show the IR-light settings saved by linux-enable-ir-emitter |
 | `faceauth version` | Show the CLI and daemon versions |
 

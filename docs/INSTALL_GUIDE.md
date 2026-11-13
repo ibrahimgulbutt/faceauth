@@ -200,6 +200,16 @@ older version can't be reused, so it isn't.
 
 ![Testing face unlock in the app](screenshots/test-dark.png)
 
+**On GNOME** (Ubuntu's normal desktop), **log out and back in once** after
+installing. From then on a small face shows while FaceAuth checks you. It
+looks for you, smiles when it recognizes you, and looks sad when it doesn't:
+
+| Lock screen | `sudo` and admin prompts |
+|---|---|
+| ![The face above the password box on the lock screen](screenshots/face-lock-looking.png) | ![The face in a card in the corner of the screen](screenshots/face-popup.png) |
+
+(These pictures come from a plain test setup. You'll see your own wallpaper.)
+
 Use **Test** in the app, or in a terminal:
 
 ```bash

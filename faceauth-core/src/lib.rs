@@ -63,6 +63,10 @@ pub enum Request {
     ListEnrolled,
     Cameras,
     Benchmark,
+    /// Follow the caller's own face checks (for the desktop's face
+    /// animation). Answered with `Watching`, then one `AuthEvent` per event
+    /// for the caller's account, until the client disconnects.
+    Watch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,9 +91,21 @@ pub enum Response {
     Users(Vec<EnrolledUser>),
     Cameras(Vec<CameraDevice>),
     Benchmark(BenchmarkReport),
+    Watching,
+    AuthEvent(AuthEvent),
     /// The caller is not allowed to do this.
     Denied { reason: String },
     Error { message: String },
+}
+
+/// A face check for the watching user, from whatever asked for it (sudo, the
+/// lock screen, an admin prompt).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthEvent {
+    /// The camera is looking.
+    Scanning,
+    /// The check ended (also sent for checks that never reached the camera).
+    Finished(AuthOutcome),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,6 +422,20 @@ mod base64_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GNOME Shell extension parses these by hand; keep them stable.
+    #[test]
+    fn watch_wire_format() {
+        assert_eq!(serde_json::to_string(&Request::Watch).unwrap(), r#""Watch""#);
+        assert_eq!(serde_json::to_string(&Response::Watching).unwrap(), r#""Watching""#);
+        let ev = |e| serde_json::to_string(&Response::AuthEvent(e)).unwrap();
+        assert_eq!(ev(AuthEvent::Scanning), r#"{"AuthEvent":"Scanning"}"#);
+        assert_eq!(ev(AuthEvent::Finished(AuthOutcome::Matched)), r#"{"AuthEvent":{"Finished":"Matched"}}"#);
+        assert_eq!(
+            ev(AuthEvent::Finished(AuthOutcome::LockedOut { seconds: 5 })),
+            r#"{"AuthEvent":{"Finished":{"LockedOut":{"seconds":5}}}}"#
+        );
+    }
 
     #[test]
     fn rejects_path_escapes() {

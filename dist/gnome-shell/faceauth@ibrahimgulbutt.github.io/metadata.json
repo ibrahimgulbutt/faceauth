@@ -1,0 +1,8 @@
+{
+  "uuid": "faceauth@ibrahimgulbutt.github.io",
+  "name": "FaceAuth Hello Face",
+  "description": "Shows an animated face while FaceAuth checks your face: on the lock screen, and for sudo and admin password prompts. It looks for you, smiles when it recognizes you, and looks sad when it doesn't.",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "session-modes": ["user", "unlock-dialog"],
+  "url": "https://github.com/ibrahimgulbutt/faceauth"
+}

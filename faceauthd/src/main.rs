@@ -19,12 +19,13 @@ use camera::CameraManager;
 use config::Config;
 use detection::FaceDetector;
 use faceauth_core::{
-    encode_message, is_safe_username, AuthOutcome, EnrollEvent, EnrollFailure, EnrollMode, EnrolledUser, Request,
+    encode_message, is_safe_username, AuthEvent, AuthOutcome, EnrollEvent, EnrollFailure, EnrollMode, EnrolledUser, Request,
     Response, UserStatus, DAEMON_USER, MAX_MESSAGE_BYTES, MAX_SAMPLES, PROTOCOL_VERSION, SOCKET_DIR, VERSION,
 };
 use log::{error, info, warn};
 use recognition::FaceEngine;
 use security::{AuditLogger, ChangeGuard, RateLimiter};
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -35,8 +36,13 @@ use storage::{SecureStorage, UserProfile};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
 
+/// `Watch` connections stay open, so they are capped separately: a few per
+/// user (one per desktop session is normal) and a small total, leaving the
+/// client slots for logins.
+const MAX_WATCHERS: usize = 16;
+const MAX_WATCHERS_PER_USER: usize = 4;
 /// A connected client is dropped after this long without sending a request.
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Concurrent connections beyond this are refused.
@@ -59,11 +65,22 @@ struct Daemon {
     /// One face pipeline at a time: parallel ONNX runs just fight for the CPU.
     auth_gate: Semaphore,
     changes: ChangeGuard,
+    /// Face-check events, tagged with the uid of the account being checked.
+    events: broadcast::Sender<(u32, AuthEvent)>,
+    watchers: Watchers,
 }
 
 impl Daemon {
     fn pipeline(&self) -> Pipeline<'_> {
         Pipeline { config: &self.config, detector: &self.detector, engine: &self.engine, infrared: self.infrared }
+    }
+
+    /// Tell the account's own watchers (its desktop session) about a face check.
+    fn emit(&self, user: &str, event: AuthEvent) {
+        if let Some(uid) = users::uid_of(user) {
+            // No receivers is the normal case without a desktop watcher.
+            let _ = self.events.send((uid, event));
+        }
     }
 
     /// The profile was made with this recognizer and this kind of camera.
@@ -78,6 +95,42 @@ impl Daemon {
         let label = self.camera.try_lock().ok()?.describe();
         *self.camera_label.lock().unwrap_or_else(|p| p.into_inner()) = label.clone();
         label
+    }
+}
+
+/// Open `Watch` connections per uid.
+#[derive(Default)]
+struct Watchers {
+    per_uid: Mutex<HashMap<u32, usize>>,
+}
+
+struct WatchSlot<'a> {
+    owner: &'a Watchers,
+    uid: u32,
+}
+
+impl Watchers {
+    fn join(&self, uid: u32) -> Option<WatchSlot<'_>> {
+        let mut map = self.per_uid.lock().unwrap_or_else(|p| p.into_inner());
+        let total: usize = map.values().sum();
+        let mine = map.get(&uid).copied().unwrap_or(0);
+        if total >= MAX_WATCHERS || mine >= MAX_WATCHERS_PER_USER {
+            return None;
+        }
+        *map.entry(uid).or_default() += 1;
+        Some(WatchSlot { owner: self, uid })
+    }
+}
+
+impl Drop for WatchSlot<'_> {
+    fn drop(&mut self) {
+        let mut map = self.owner.per_uid.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = map.get_mut(&self.uid) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.uid);
+            }
+        }
     }
 }
 
@@ -126,6 +179,8 @@ fn main() -> Result<()> {
         storage,
         auth_gate: Semaphore::new(1),
         changes: ChangeGuard::default(),
+        events: broadcast::channel(16).0,
+        watchers: Watchers::default(),
     });
 
     tokio::runtime::Builder::new_multi_thread()
@@ -218,6 +273,29 @@ async fn handle_client(stream: UnixStream, peer: Peer, d: Arc<Daemon>) -> Result
                 send(&mut wr, &Response::Cameras(devices)).await?
             }
             Request::Benchmark => send(&mut wr, &benchmark(&d).await).await?,
+            Request::Watch => return watch(&d, peer, &mut rd, &mut wr).await,
+        }
+    }
+}
+
+/// Stream the caller's own face-check events until they disconnect. A user
+/// only ever learns when their own account is being checked, and the result.
+async fn watch(d: &Arc<Daemon>, peer: Peer, rd: &mut OwnedReadHalf, wr: &mut OwnedWriteHalf) -> Result<()> {
+    let Some(_slot) = d.watchers.join(peer.uid) else {
+        return send(wr, &Response::Denied { reason: "too many watchers".into() }).await;
+    };
+    let mut events = d.events.subscribe();
+    send(wr, &Response::Watching).await?;
+    let mut probe = [0u8; 1];
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Ok((uid, event)) if uid == peer.uid => send(wr, &Response::AuthEvent(event)).await?,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
+            // Watchers send nothing after `Watch`: EOF (or anything else) ends it.
+            _ = rd.read(&mut probe) => return Ok(()),
         }
     }
 }
@@ -323,7 +401,11 @@ async fn authenticate(d: &Arc<Daemon>, peer: Peer, user: String, wr: &mut OwnedW
         AuditLogger::denied("authenticate", Some(&user), peer.uid, "caller is neither root nor the user");
         return send(wr, &Response::Denied { reason: "you can only authenticate yourself".into() }).await;
     }
-    let outcome = |o: AuthOutcome| Response::Auth(o);
+    // Every outcome is also told to the account's desktop watchers.
+    let outcome = |o: AuthOutcome| {
+        d.emit(&user, AuthEvent::Finished(o));
+        Response::Auth(o)
+    };
 
     // Cheap checks first: none of these touch the camera.
     let profile = match d.storage.load_user(&user) {
@@ -367,6 +449,7 @@ async fn authenticate(d: &Arc<Daemon>, peer: Peer, user: String, wr: &mut OwnedW
         })
     };
     if ready_rx.await.is_ok() {
+        d.emit(&user, AuthEvent::Scanning);
         // Tell PAM to show "look at the camera" now that capture is starting.
         if send(wr, &Response::Scanning).await.is_err() {
             // PAM gave up; still finish so the camera closes cleanly.
@@ -586,5 +669,25 @@ fn log_system_facts() {
     info!("{cores} CPU cores, {} MB RAM available", mem_mb.map_or("?".into(), |m| m.to_string()));
     if mem_mb.is_some_and(|m| m < 500) {
         warn!("Low memory; face processing may be slow");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchers_are_capped_per_user_and_in_total() {
+        let w = Watchers::default();
+        let mine: Vec<_> = (0..MAX_WATCHERS_PER_USER).map(|_| w.join(1000).expect("within the per-user cap")).collect();
+        assert!(w.join(1000).is_none(), "per-user cap");
+        drop(mine);
+        assert!(w.join(1000).is_some(), "slots are freed when a watcher leaves");
+
+        let w = Watchers::default();
+        let all: Vec<_> = (0..MAX_WATCHERS as u32).map(|i| w.join(i).expect("within the total cap")).collect();
+        assert!(w.join(99_999).is_none(), "total cap");
+        drop(all);
+        assert!(w.per_uid.lock().unwrap().is_empty());
     }
 }

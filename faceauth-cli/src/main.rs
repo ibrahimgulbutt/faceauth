@@ -77,6 +77,8 @@ enum Command {
         #[arg(long)]
         toml: bool,
     },
+    /// Print your face checks as they happen (sudo, lock screen, admin prompts)
+    Watch,
     /// Print client and daemon versions
     Version,
     /// Exit 0 if the daemon answers (for scripts)
@@ -95,6 +97,7 @@ fn main() -> ExitCode {
         Command::Doctor => doctor(),
         Command::Benchmark => benchmark(),
         Command::IrEmitter { file, toml } => ir_emitter_cmd(file, toml),
+        Command::Watch => watch(),
         Command::Version => version(),
         Command::Ping => return if ping().is_ok() { ExitCode::SUCCESS } else { ExitCode::FAILURE },
     };
@@ -383,6 +386,26 @@ fn ir_emitter_cmd(file: Option<std::path::PathBuf>, toml_only: bool) -> Result<E
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn watch() -> Result<ExitCode> {
+    let mut stream = connect(Duration::from_secs(5))?;
+    send_message(&mut stream, &Request::Watch)?;
+    match recv_message(&mut stream)? {
+        Response::Watching => {}
+        other => return Err(unexpected(other)),
+    }
+    stream.set_read_timeout(None)?;
+    println!("Watching your face checks. Press Ctrl+C to stop.");
+    loop {
+        match recv_message::<_, Response>(&mut stream) {
+            Ok(Response::AuthEvent(faceauth_core::AuthEvent::Scanning)) => println!("{}  looking…", term::now()),
+            Ok(Response::AuthEvent(faceauth_core::AuthEvent::Finished(o))) => println!("{}  {}", term::now(), o.message()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => bail!("the FaceAuth service stopped"),
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 fn version() -> Result<ExitCode> {

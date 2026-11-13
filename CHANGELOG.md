@@ -120,6 +120,13 @@ privilege-escalation bugs; upgrade, and set up face unlock again afterwards.
   waiting forever.
 - `faceauth benchmark` reports the face brightness and warns when an IR
   camera's light seems to be off.
+- **A face that reacts (GNOME 45+).** A GNOME Shell extension shows an
+  animated face while FaceAuth checks you: on the lock screen in place of your
+  picture, and in the corner for sudo and admin prompts. It looks for you,
+  smiles when you're recognized and looks sad when you're not. It's driven by
+  the new `Watch` request, which streams only the caller's own face checks
+  (capped at 4 watchers per user, 16 in all). The installer adds and enables
+  it (`--no-animation` skips it); `faceauth watch` prints the same events.
 - **Step-by-step install guide with screenshots** (`docs/INSTALL_GUIDE.md`).
 - **One command does everything.** An infrared camera is offered (and is the
   default answer) when present. The installer checks the IR light through the camera; if it's
