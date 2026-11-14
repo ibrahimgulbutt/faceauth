@@ -288,13 +288,16 @@ Then `sudo systemctl restart faceauth` and set up face unlock again (faces
 look different in infrared, so colour face data doesn't carry over).
 `faceauth cameras` lists your cameras and marks the IR ones.
 
-**The emitter.** On Windows a vendor driver switches the emitter on. Linux's
-generic camera driver doesn't know that vendor command, so on many laptops the
-emitter stays off and the IR picture is nearly black. To check, run
-`faceauth benchmark` while looking at the camera: a face brightness below about
-40 means the emitter is off. You can also look at the camera through a phone
-camera while it runs: phone cameras show the emitter as a flickering purple
-light.
+**The emitter.** Many IR cameras switch their emitter on by themselves. It
+lights only what's close, so the picture looks dark but your face shows up
+dim and clear, and FaceAuth recognizes it. On other laptops a vendor driver
+switches it on under Windows; Linux's generic camera driver doesn't know that
+vendor command, so the emitter stays off and the camera sees nothing in the
+dark. To check, run `faceauth benchmark` while looking at the camera: if it
+shows a face brightness, the emitter works (dim is normal for infrared); if
+it says "none in view" while you're looking at it, the emitter is off. You
+can also look at the camera through a phone camera while it runs: phone
+cameras show the emitter as a flickering purple light.
 
 **The installer handles this, by itself.** When you choose the infrared
 camera, `faceauth ir-setup` tries the camera's vendor settings one at a time

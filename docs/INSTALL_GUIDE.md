@@ -153,9 +153,8 @@ Only your face should be in view.
 
 **Already set up before, or changed camera?** Face data from another camera
 or an older version can't be reused. The installer notices and offers to set
-up your face again right away. Otherwise, if the app says face unlock is
-**paused**, choose **Set Up Again**. Face data from another camera or an
-older version can't be reused, so it isn't.
+up your face again right away. If you skip that, the app says face unlock is
+**paused**; choose **Set Up Again**.
 
 ---
 
@@ -218,7 +217,7 @@ tells you what to fix.
 | `sudo: ./install.sh: command not found` | You're not in the FaceAuth folder. `cd` into it first. |
 | `Run this as your regular user, not root` | You're in a root shell (`root@…#`). Type `exit`, then run the installer again. |
 | The infrared picture is black in a bright room | Normal: room lights give off almost no infrared. The camera's own light has to be on; see [step 3](#3-switch-on-the-infrared-light-infrared-cameras-only). |
-| Not sure the infrared light works | `faceauth benchmark` while looking at the camera: face brightness above 40 means it's on. |
+| Not sure the infrared light works | `faceauth benchmark` while looking at the camera. If it shows a face brightness, the light works (dim is normal for infrared). If it says "none in view" while you're looking at it, the light is off. |
 | The app says face unlock is **paused** | The camera or face model changed. Choose **Set Up Again**. |
 | No password dialog when setting up | Run `faceauth enroll` in a terminal instead. |
 | Not recognized in the dark with the normal camera | A normal camera can't see in the dark. Use the infrared camera. |

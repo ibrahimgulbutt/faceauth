@@ -541,7 +541,8 @@ fn doctor() -> Result<ExitCode> {
         match ir_emitter::configured_in(std::path::Path::new("/etc/faceauth/config.toml")) {
             Some(n) if n > 0 => check(Some(true), "IR light", format!("FaceAuth switches it on ({n} command(s))")),
             _ if saved.is_some() => check(None, "IR light", "linux-enable-ir-emitter settings found but not used — see: faceauth ir-emitter".into()),
-            _ => check(None, "IR light", "not switched on by FaceAuth — to search for it: sudo faceauth ir-setup".into()),
+            // Most IR cameras light it themselves; the installer keeps IR only if it saw a face.
+            _ => check(Some(true), "IR light", "the camera switches it on itself (if it can't see you in the dark: sudo faceauth ir-setup)".into()),
         }
     }
     let config = std::path::Path::new("/etc/faceauth/config.toml");
