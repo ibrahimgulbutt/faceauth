@@ -138,6 +138,12 @@ privilege-escalation bugs; upgrade, and set up face unlock again afterwards.
   each try, long controls (calibration or firmware data) are never touched, a
   camera that drops out is reopened, and the search has a time limit. No
   external tool or interactive screen is needed any more.
+- **An IR camera that can see the face counts as working.** Its own light
+  only lights what's close, so faces measure ~15–40 and the picture is dark,
+  yet they're recognised (low-light brightening). The installer, `ir-setup`
+  and setup now judge an IR camera by whether a face is found, not by
+  brightness; setup accepts IR faces down to 10. (A brightness-40 rule had
+  wrongly declared a working IR camera "light off" and switched to colour.)
 - **No more "set up again" surprises.** When the installer changes camera,
   or face data is otherwise unusable, it offers to set up the face right away.
 - **One command does everything.** An infrared camera is offered (and is the

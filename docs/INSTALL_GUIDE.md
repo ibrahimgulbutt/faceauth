@@ -87,7 +87,18 @@ doesn't know that vendor command, so on many laptops the light stays off and
 the infrared picture is almost black, **even in a bright room**: normal room
 lights give off almost no infrared.
 
-The installer handles this by itself. You only have to look at the camera:
+Many IR cameras switch their light on by themselves; it only lights what's
+close, so the room looks dark but your face is visible. The installer checks
+whether the IR camera can find your face, and if it can, you're done:
+
+```
+==> Setting up the infrared camera
+    Look at the camera, then press Enter:
+    ✓ The infrared camera can see you (face brightness 22; dim is normal for infrared)
+```
+
+If it can't see you, the installer tries to switch the light on by itself.
+You only have to keep looking at the camera:
 
 ```
 ==> Setting up the infrared camera
@@ -97,7 +108,7 @@ The installer handles this by itself. You only have to look at the camera:
   154 settings to try (face brightness now 24 of 255)
   Tried 60 of 154…
 ✓ Found it: brightness 24 → 140.
-    ✓ The infrared light works (face brightness 140)
+    ✓ The infrared camera can see you now (face brightness 140)
 ```
 
 FaceAuth tries the camera's hidden settings one at a time. After each, it

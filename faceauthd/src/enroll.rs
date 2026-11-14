@@ -34,6 +34,9 @@ const PREVIEW_QUALITY: u8 = 78;
 /// single accepted sample (~10 s). The saved face data was probably made with
 /// another model or camera, and waiting won't help.
 const MAX_MISMATCHES: u32 = 25;
+/// Infrared faces lit by the camera's own light measure ~15–40 and match
+/// well; below this the light is really off.
+const IR_MIN_FACE_BRIGHTNESS: f32 = 10.0;
 
 pub fn steps(mode: EnrollMode) -> Vec<Pose> {
     use Pose::*;
@@ -251,8 +254,10 @@ impl<'a> Gate<'a> {
         }
         let brightness = detection::face_brightness(frame, face);
         // Dim faces are brightened before recognition, so only reject the
-        // really dark ones (mostly noise).
-        if brightness < 28.0 {
+        // really dark ones (mostly noise). An IR camera's own light leaves
+        // faces dim but clean, so it gets a lower floor.
+        let floor = if self.p.infrared { IR_MIN_FACE_BRIGHTNESS } else { 28.0 };
+        if brightness < floor {
             return Ok(if self.p.infrared { Hint::IrLightOff } else { Hint::TooDark });
         }
         if brightness > 215.0 {

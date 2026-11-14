@@ -35,7 +35,8 @@ const MAX_CONTROL_LEN: usize = 16;
 const LIT: f32 = 55.0;
 const LIT_FACTOR: f32 = 1.7;
 const LIT_GAIN: f32 = 20.0;
-/// This bright before anything changes: the light is already on.
+/// This bright before anything changes: the light is already on (even with
+/// no face found).
 const ALREADY_ON: f32 = 90.0;
 /// Time for a changed control to take effect.
 const SETTLE: Duration = Duration::from_millis(150);
@@ -49,9 +50,16 @@ pub fn search(detector: &FaceDetector, tx: &Sender<Response>, cancel: &AtomicBoo
     // Small controls first: that's where emitter switches usually are.
     controls.sort_by_key(|c| c.init.len());
 
-    let base = baseline(&mut stream, detector)?;
-    info!("IR setup: {} vendor controls on /dev/video{}, brightness {base:.0}", controls.len(), stream.index);
-    if base >= ALREADY_ON {
+    let (base, faces) = baseline(&mut stream, detector)?;
+    info!(
+        "IR setup: {} vendor controls on /dev/video{}, brightness {base:.0}, face in {faces} of 3 looks",
+        controls.len(),
+        stream.index
+    );
+    // The camera already sees the face: its light works (it only lights what
+    // is close, so the face can be dim and still be recognised; dim faces
+    // are brightened before recognition). Nothing to search for.
+    if faces >= 2 || base >= ALREADY_ON {
         return Ok(IrSetupEvent::Found { controls: Vec::new(), before: base, after: base });
     }
 
@@ -144,10 +152,13 @@ fn restore(device: &UvcDevice, ctrl: &XuControl) -> Result<()> {
     })
 }
 
-fn baseline(stream: &mut IrStream, detector: &FaceDetector) -> Result<f32> {
-    let mut levels = [measure(stream, detector)?, measure(stream, detector)?, measure(stream, detector)?];
+/// Median brightness of three looks, and in how many a face was found.
+fn baseline(stream: &mut IrStream, detector: &FaceDetector) -> Result<(f32, usize)> {
+    let looks = [look(stream, detector)?, look(stream, detector)?, look(stream, detector)?];
+    let faces = looks.iter().filter(|(_, face)| *face).count();
+    let mut levels = looks.map(|(level, _)| level);
     levels.sort_by(|a, b| a.total_cmp(b));
-    Ok(levels[1])
+    Ok((levels[1], faces))
 }
 
 /// A measurement that survives a control knocking the stream over once:
@@ -173,6 +184,11 @@ fn measure_or_recover(
 /// brightest of a few fresh frames, so an emitter that flashes on every
 /// other frame still counts.
 fn measure(stream: &mut IrStream, detector: &FaceDetector) -> Result<f32> {
+    Ok(look(stream, detector)?.0)
+}
+
+/// Brightness as for `measure`, and whether a face was found.
+fn look(stream: &mut IrStream, detector: &FaceDetector) -> Result<(f32, bool)> {
     // Frames queued before the change are stale.
     for _ in 0..2 {
         stream.frame()?;
@@ -188,8 +204,8 @@ fn measure(stream: &mut IrStream, detector: &FaceDetector) -> Result<f32> {
     let (_, frame) = best.expect("three frames were read");
     let faces = detector.detect(&frame).unwrap_or_default();
     Ok(match detection::primary(&faces) {
-        Some(face) => detection::face_brightness(&frame, face),
-        None => centre_brightness(&frame),
+        Some(face) => (detection::face_brightness(&frame, face), true),
+        None => (centre_brightness(&frame), false),
     })
 }
 

@@ -137,8 +137,9 @@ Enrollment runs entirely in the daemon. The full flow is in
 - **A sample is accepted only when:**
   - there is exactly one face;
   - it is at least `min_face_size` px wide;
-  - face brightness is 28–215 (dim faces are brightened; below 28 an IR camera
-    reports that its light seems off);
+  - face brightness is 28–215 on a colour camera, 10–215 on an IR camera
+    (dim faces are brightened; an IR camera's own light leaves faces dim but
+    clean; below 10 it reports that its light seems off);
   - the pose matches;
   - similarity is ≥ 0.40 to the samples already collected (same person);
   - similarity is ≤ 0.92 to each of them (not a duplicate);

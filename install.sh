@@ -660,6 +660,8 @@ fi
 # unlock keeps working.
 
 # Face brightness (0–255) seen by the camera in use, or nothing if no face.
+# For an IR camera, a face being found at all is what counts: its own light
+# leaves faces dim (often 15–40) but recognisable.
 ir_face_brightness() {
     env -u FACEAUTH_SOCKET "$PREFIX/bin/faceauth" benchmark 2>/dev/null \
         | sed -n 's/^Face[[:space:]]*brightness \([0-9][0-9]*\).*/\1/p'
@@ -697,11 +699,11 @@ setup_ir_light() {
     fi
     sleep 1
     level=$(ir_face_brightness)
-    if [ -n "$level" ] && [ "$level" -ge 40 ]; then
-        ok "The infrared light works (face brightness $level)"
+    if [ -n "$level" ]; then
+        ok "The infrared camera can see you now (face brightness $level)"
         return 0
     fi
-    warn "The light still looks off (face brightness ${level:-none})."
+    warn "The infrared camera still can't see your face."
     return 1
 }
 
@@ -711,8 +713,13 @@ if [ "$SERVICE_OK" -eq 1 ] && [ "${CAMERA_CHOICE:-${CURRENT_CAMERA:-auto}}" = "i
         ask "    Look at the camera, then press Enter: " "" >/dev/null
     fi
     IR_LEVEL=$(ir_face_brightness)
-    if has_emitter_config && [ -n "$IR_LEVEL" ] && [ "$IR_LEVEL" -ge 40 ]; then
-        ok "The infrared light works (face brightness $IR_LEVEL)"
+    if [ -z "$IR_LEVEL" ] && [ "$HAVE_TTY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then
+        # One miss is often just looking at the screen.
+        ask "    I couldn't see your face. Look straight at the camera, then press Enter: " "" >/dev/null
+        IR_LEVEL=$(ir_face_brightness)
+    fi
+    if [ -n "$IR_LEVEL" ]; then
+        ok "The infrared camera can see you (face brightness $IR_LEVEL; dim is normal for infrared)"
     elif ! setup_ir_light; then
         info "This camera's infrared light couldn't be switched on, so it can't see in the dark."
         use_colour_camera

@@ -339,10 +339,12 @@ fn benchmark() -> Result<ExitCode> {
             println!("Total        {:>7.0} ms", b.total_ms);
             match b.face_brightness {
                 None => println!("Face         {}", Style::Warn.paint("none in view")),
-                Some(v) if v < 40.0 && b.infrared => println!(
+                // An IR camera's own light leaves faces dim but recognisable.
+                Some(v) if b.infrared && v < 10.0 => println!(
                     "Face         brightness {v:.0} of 255 — {}",
-                    Style::Warn.paint("too dark: the infrared light seems to be off (see the README)")
+                    Style::Warn.paint("very dark: the infrared light may be off (see the README)")
                 ),
+                Some(v) if b.infrared => println!("Face         brightness {v:.0} of 255 (infrared: dim is normal)"),
                 Some(v) if v < 40.0 => println!("Face         brightness {v:.0} of 255 — {}", Style::Warn.paint("dark; face unlock may fail")),
                 Some(v) => println!("Face         brightness {v:.0} of 255"),
             }
