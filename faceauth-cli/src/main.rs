@@ -362,8 +362,9 @@ fn ir_setup(toml_only: bool) -> Result<ExitCode> {
     }
     let mut stream = connect(Duration::from_secs(90))?;
     send_message(&mut stream, &Request::SetupIrEmitter)?;
-    eprintln!("Looking for the setting that switches on the infrared light.");
-    eprintln!("Sit in front of the camera, fairly close, and keep still. This takes a few minutes.");
+    eprintln!("Switching on the infrared light automatically.");
+    eprintln!("Sit in front of the camera, fairly close, and keep still while FaceAuth tries the");
+    eprintln!("camera's settings. This takes a few minutes.");
     loop {
         match recv_message::<_, Response>(&mut stream)? {
             Response::IrSetup(IrSetupEvent::Started { total, brightness }) => {
@@ -531,13 +532,14 @@ fn doctor() -> Result<ExitCode> {
     }
     let policy = std::path::Path::new("/usr/share/polkit-1/actions/org.faceauth.manage.policy");
     check(Some(policy.exists()), "Polkit policy", if policy.exists() { "installed".into() } else { format!("{} missing — setup cannot ask for your password", policy.display()) });
-    if ir_emitter::has_ir_camera() {
+    // Only relevant when the infrared camera is the one in use.
+    if ir_emitter::has_ir_camera() && fetch_status().is_ok_and(|s| s.infrared) {
         let tool = ir_emitter::tool_config_path().filter(|p| p.exists());
         let saved = tool.as_deref().and_then(|p| ir_emitter::find(p).ok().flatten());
         match ir_emitter::configured_in(std::path::Path::new("/etc/faceauth/config.toml")) {
             Some(n) if n > 0 => check(Some(true), "IR light", format!("FaceAuth switches it on ({n} command(s))")),
             _ if saved.is_some() => check(None, "IR light", "linux-enable-ir-emitter settings found but not used — see: faceauth ir-emitter".into()),
-            _ => check(None, "IR light", "not set up (only needed to use the IR camera in the dark) — see: faceauth ir-emitter".into()),
+            _ => check(None, "IR light", "not switched on by FaceAuth — to search for it: sudo faceauth ir-setup".into()),
         }
     }
     let config = std::path::Path::new("/etc/faceauth/config.toml");

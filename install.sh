@@ -688,8 +688,6 @@ has_emitter_config() {
 # setup_ir_light — find and save the setting that switches the IR light on.
 # Succeeds only if the light then works.
 setup_ir_light() {
-    info "Switching on the infrared light automatically. Sit in front of the camera, fairly"
-    info "close, and keep still while FaceAuth tries the camera's settings (a few minutes)."
     local toml rc=0 level
     toml=$(sudo env -u FACEAUTH_SOCKET "$PREFIX/bin/faceauth" ir-setup --toml) || rc=$?
     [ "$rc" -eq 0 ] || return 1
@@ -937,17 +935,18 @@ else
 fi
 info ""
 info "${BOLD}Next:${NC}"
-if [ "$BUILD_GUI" -eq 1 ]; then
+# Only suggest setting up when the face isn't set up (or is paused).
+if env -u FACEAUTH_SOCKET "$PREFIX/bin/faceauth" status 2>/dev/null | grep -q "is set up for"; then
+    info "  Your face is set up. Try it:  sudo echo 'Hello from FaceAuth'"
+elif [ "$BUILD_GUI" -eq 1 ]; then
     info "  1. Open ${BOLD}Face Unlock${NC} from your app menu and choose Set Up"
     info "     (or run: faceauth enroll)"
+    info "  2. Try it:             sudo echo 'Hello from FaceAuth'"
 else
     info "  1. Set up your face:   faceauth enroll"
+    info "  2. Try it:             sudo echo 'Hello from FaceAuth'"
 fi
-info "  2. Try it:             sudo echo 'Hello from FaceAuth'"
 info ""
-if [ "${CAMERA_CHOICE:-${CURRENT_CAMERA:-auto}}" = "ir" ]; then
-    info "Check the IR light: faceauth benchmark (face brightness should be above 40)"
-fi
 if [ "$FACE_ANIMATION" -eq 1 ]; then
     info "Face animation:    log out and back in once to see it (lock screen, sudo)"
 fi
