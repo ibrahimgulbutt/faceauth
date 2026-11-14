@@ -255,29 +255,66 @@ distro_family() {
     echo unknown
 }
 
+# pkg_run CMD... — run a package-manager command, waiting (up to 10 minutes)
+# while another one holds its lock: Ubuntu's automatic updates, the Software
+# app, or an update running in another terminal.
+pkg_run() {
+    local err waited=0
+    err=$(mktemp)
+    while :; do
+        if "$@" 2>"$err"; then
+            cat "$err" >&2
+            rm -f "$err"
+            return 0
+        fi
+        if ! grep -Eqi "could not get lock|unable to lock|is held by process|lock database|system management is locked" "$err"; then
+            cat "$err" >&2
+            rm -f "$err"
+            return 1
+        fi
+        if [ "$waited" -ge 600 ]; then
+            rm -f "$err"
+            die "Another program kept the package manager busy for 10 minutes. Try again when it has finished."
+        fi
+        [ "$waited" -eq 0 ] && info "Waiting for another software update to finish (Ubuntu Software or automatic updates)..."
+        sleep 5
+        waited=$((waited + 5))
+    done
+}
+
 install_deps() {
-    local family gui_pkgs=()
+    local family gui_pkgs=() pkgs=() missing=()
     family=$(distro_family)
     case "$family" in
         debian)
             [ "$WANT_GUI" -eq 1 ] && gui_pkgs=(libgtk-4-dev libadwaita-1-dev)
-            sudo apt-get update -qq
-            sudo apt-get install -y -q build-essential pkg-config libpam0g-dev clang libclang-dev \
-                curl git ca-certificates unzip "${gui_pkgs[@]}"
+            pkgs=(build-essential pkg-config libpam0g-dev clang libclang-dev curl git ca-certificates unzip "${gui_pkgs[@]}")
+            for p in "${pkgs[@]}"; do
+                dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || missing+=("$p")
+            done
+            # Nothing to do on a re-run, so don't touch apt at all.
+            [ "${#missing[@]}" -eq 0 ] && return 0
+            info "Installing: ${missing[*]}"
+            pkg_run sudo apt-get update -qq
+            pkg_run sudo apt-get install -y -q "${missing[@]}"
             ;;
         fedora)
             [ "$WANT_GUI" -eq 1 ] && gui_pkgs=(gtk4-devel libadwaita-devel)
-            sudo dnf install -y -q gcc gcc-c++ pkg-config pam-devel clang clang-devel \
-                curl git unzip "${gui_pkgs[@]}"
+            pkgs=(gcc gcc-c++ pkg-config pam-devel clang clang-devel curl git unzip "${gui_pkgs[@]}")
+            rpm -q "${pkgs[@]}" >/dev/null 2>&1 && return 0
+            pkg_run sudo dnf install -y -q "${pkgs[@]}"
             ;;
         arch)
             [ "$WANT_GUI" -eq 1 ] && gui_pkgs=(gtk4 libadwaita)
-            sudo pacman -S --needed --noconfirm base-devel pam clang curl git unzip "${gui_pkgs[@]}"
+            pkgs=(base-devel pam clang curl git unzip "${gui_pkgs[@]}")
+            pacman -T "${pkgs[@]}" >/dev/null 2>&1 && return 0
+            pkg_run sudo pacman -S --needed --noconfirm "${pkgs[@]}"
             ;;
         suse)
             [ "$WANT_GUI" -eq 1 ] && gui_pkgs=(gtk4-devel libadwaita-devel)
-            sudo zypper --non-interactive install gcc gcc-c++ pkg-config pam-devel clang \
-                curl git unzip "${gui_pkgs[@]}"
+            pkgs=(gcc gcc-c++ pkg-config pam-devel clang curl git unzip "${gui_pkgs[@]}")
+            rpm -q "${pkgs[@]}" >/dev/null 2>&1 && return 0
+            pkg_run sudo zypper --non-interactive install "${pkgs[@]}"
             ;;
         *)
             warn "Unsupported distribution: $OS_ID. Install these yourself:"
